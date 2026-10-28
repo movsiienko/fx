@@ -2739,6 +2739,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
         state.cfg.auth_mode,
+        null,
         state.cfg.model_override,
     );
 }
@@ -4117,6 +4118,8 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
             }
         }
     }
+    // `fx acp --permission-mode` beats the saved mode, as FX_PERMISSION_MODE does.
+    if (state.cfg.permission_override) |mode| state.permission_mode = mode;
     return .{
         .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
         .permission_mode = state.permission_mode,
