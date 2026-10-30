@@ -32,6 +32,7 @@ pub const TopLevelKind = enum {
     upgrade,
     replay,
     workspace,
+    extensions,
 };
 
 pub const SlashKind = enum {
@@ -73,6 +74,7 @@ pub const SlashKind = enum {
     workspace,
     shell,
     version,
+    extensions,
 };
 
 pub const OptionDoc = struct {

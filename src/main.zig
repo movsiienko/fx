@@ -83,6 +83,7 @@ const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
+const lua_host = @import("core/lua_host/lua_host.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
@@ -410,6 +411,7 @@ const App = struct {
         builtin_hooks.notifications.provider(Self),
     );
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LuaHookAppRuntime = lua_host.AppRuntime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -545,6 +547,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    lua_hooks: lua_host.Hooks = .{},
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
@@ -738,9 +741,10 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register herdr and Lua hooks before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try LuaHookAppRuntime.configure(self);
         try NotificationAppRuntime.configure(self);
     }
 
@@ -990,6 +994,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        self.lua_hooks.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3773,6 +3778,7 @@ test "footer runtime compatibility facade exports composeFooterFrame" {
 test "interactive app keeps notification handlers registered for live preference changes" {
     var app = App{ .alloc = std.testing.allocator };
     defer app.lifecycle_runtime.deinit();
+    defer app.lua_hooks.deinit();
 
     try app.configureNotifications();
 
@@ -4662,6 +4668,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("core/agent/runtime/journal.zig");
+    _ = @import("core/lua_host/lua_host.zig");
+    _ = @import("lua/engine.zig");
     _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");

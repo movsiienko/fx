@@ -31,6 +31,7 @@ const http_pool = @import("../shared/http_pool.zig");
 const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
+const lua_host = @import("../lua_host/lua_host.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const select_watch = @import("../shared/select_watch.zig");
@@ -645,6 +646,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    lua_hooks: lua_host.Hooks = .{},
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -697,6 +699,13 @@ const AskContext = struct {
                 .ctx = self,
                 .run = attentionRequiredNotification,
             });
+        }
+        const lua_summary = try self.lua_hooks.register(self.alloc, &self.lifecycle_runtime, .{});
+        if (try lua_host.noticeText(self.alloc, lua_summary, "fx extensions list")) |notice| {
+            defer self.alloc.free(notice);
+            try self.writeStderr("fx ask: ");
+            try self.writeStderr(notice);
+            try self.writeStderr("\n");
         }
         self.lifecycle_view = self.lifecycle_runtime.freeze();
     }
@@ -773,6 +782,7 @@ const AskContext = struct {
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        self.lua_hooks.deinit();
         if (self.v2) |v2| v2.close();
         self.v2 = null;
         if (self.v2_store) |*store| store.deinit(self.alloc);

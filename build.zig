@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
     build_options.addOption(bool, "builtin_tools", true);
+    // Whether this build embeds Lua for extension hooks (see addLua).
+    build_options.addOption(bool, "lua_hooks", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -87,6 +89,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    const lua = addLua(b, target, optimize);
+    lua.embedIn(exe.root_module);
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
     exe.root_module.addImport("fuzz_seed", fuzz_seed);
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
@@ -168,6 +172,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     fuzz_root.addImport("build_options", build_options.createModule());
+    lua.embedIn(fuzz_root);
     fuzz_root.addImport("fuzz_corpus", fuzz_corpus);
     fuzz_root.addImport("fuzz_seed", fuzz_seed);
     fuzz_root.addImport("session_manager", session_manager);
@@ -345,6 +350,61 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// The vendored Lua 5.4 sources behind extension hooks, built once as a
+/// static library, with their header as the `lua_c` import.
+/// Only the native fx binary, its tests, and its fuzz targets embed Lua:
+/// libfx stays Lua-free. The `io`, `os`, `package`, `debug` and `coroutine`
+/// libraries are left out. A separate library keeps the C code out of the
+/// coverage instrumentation that `zig build fuzz --fuzz` adds to tests.
+const Lua = struct {
+    c_module: *std.Build.Module,
+    library: *std.Build.Step.Compile,
+
+    fn embedIn(self: Lua, module: *std.Build.Module) void {
+        module.addImport("lua_c", self.c_module);
+        module.linkLibrary(self.library);
+    }
+};
+
+fn addLua(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) Lua {
+    const lua_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lua/vendor/fx_lua.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_c.addIncludePath(b.path("src/lua/vendor"));
+
+    const lua = b.addLibrary(.{
+        .linkage = .static,
+        .name = "fx-lua",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lua.root_module.addCSourceFiles(.{
+        .root = b.path("src/lua/vendor"),
+        .files = &.{
+            "lapi.c",     "lcode.c",    "lctype.c",   "ldebug.c",  "ldo.c",
+            "ldump.c",    "lfunc.c",    "lgc.c",      "llex.c",    "lmem.c",
+            "lobject.c",  "lopcodes.c", "lparser.c",  "lstate.c",  "lstring.c",
+            "ltable.c",   "ltm.c",      "lundump.c",  "lvm.c",     "lzio.c",
+            "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c", "ltablib.c",
+            "lutf8lib.c",
+        },
+        .flags = if (optimize == .debug)
+            &.{"-std=gnu99"}
+        else
+            &.{ "-std=gnu99", "-Os" },
+    });
+    return .{ .c_module = lua_c.createModule(), .library = lua };
+}
+
 fn addWasmArtifact(
     b: *std.Build,
     surface: WasmSurface,
@@ -374,6 +434,7 @@ fn addWasmArtifact(
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
     wasm_options.addOption(bool, "builtin_tools", true);
+    wasm_options.addOption(bool, "lua_hooks", false);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -422,6 +483,7 @@ fn addNapiArtifact(
     napi_options.addOption(bool, "libfx", true);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
+    napi_options.addOption(bool, "lua_hooks", false);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",

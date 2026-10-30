@@ -22,6 +22,7 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const lua_host = @import("../lua_host/lua_host.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -420,6 +421,221 @@ pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => "settings path is unsafe",
         else => "workspace update failed",
     };
+}
+
+/// `fx extensions` and `/extensions`: the extensions in `~/.fx/extensions/`
+/// and whether each runs, after the action the user took.
+pub const ExtensionsSnapshot = struct {
+    listing: *const lua_host.Listing,
+
+    pub fn render(self: ExtensionsSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
+        return self.renderLines(alloc, "[extensions] ", "fx extensions");
+    }
+
+    pub fn renderInteractiveBody(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
+        const text = try self.renderLines(alloc, "", "/extensions");
+        // The transcript adds the final line break itself.
+        if (text.len > 0 and text[text.len - 1] == '\n') {
+            return alloc.realloc(text, text.len - 1);
+        }
+        return text;
+    }
+
+    fn renderLines(self: ExtensionsSnapshot, alloc: Allocator, prefix: []const u8, command: []const u8) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const w = &out.writer;
+        const listing = self.listing;
+
+        try w.print("{s}directory=", .{prefix});
+        try writeTerminalSafe(w, alloc, listing.directory);
+        try w.writeByte('\n');
+        if (listing.action.target()) |name| {
+            const done = switch (listing.action) {
+                .trust => "trusted",
+                .disable => "disabled",
+                .enable => "enabled",
+                .list => unreachable,
+            };
+            try w.print("{s}{s} {s}; this takes effect the next time fx starts\n", .{ prefix, done, name });
+        }
+        if (listing.entries.len == 0) {
+            try w.print("{s}extensions: (none)\n", .{prefix});
+            return try out.toOwnedSlice();
+        }
+        try w.print("{s}extensions:\n", .{prefix});
+        for (listing.entries) |entry| {
+            try w.print(" - {s}", .{entry.name});
+            if (entry.version.len > 0) {
+                try w.writeByte(' ');
+                try writeTerminalSafe(w, alloc, entry.version);
+            }
+            try w.print(" state={s}", .{@tagName(entry.state)});
+            if (entry.state != .invalid) {
+                try w.writeAll(" hooks=");
+                try writeJoined(w, entry.events);
+                try w.writeAll(" scopes=");
+                try writeJoined(w, entry.scopes);
+                try w.print(" memory_mb={d} instructions_per_call={d} kv={} files={d}", .{
+                    entry.memory_mb,
+                    entry.instructions_per_call,
+                    entry.kv,
+                    entry.file_count,
+                });
+            }
+            try w.writeByte('\n');
+            if (entry.changed_files.len > 0) {
+                try w.writeAll("   changed since trusted: ");
+                for (entry.changed_files, 0..) |path, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try writeTerminalSafe(w, alloc, path);
+                }
+                try w.writeByte('\n');
+            }
+            if (entry.failures > 0) {
+                try w.print("   failures={d}", .{entry.failures});
+                if (entry.last_error) |last_error| {
+                    try w.writeAll(" last_error=");
+                    try writeTerminalSafe(w, alloc, last_error);
+                }
+                try w.writeByte('\n');
+            }
+            if (entry.problem) |problem| {
+                try w.writeAll("   problem: ");
+                try writeTerminalSafe(w, alloc, problem);
+                try w.writeByte('\n');
+            }
+            switch (entry.state) {
+                .needs_review => try w.print("   review its files in {s}/{s}, then run: {s} trust {s}\n", .{
+                    listing.directory,
+                    entry.name,
+                    command,
+                    entry.name,
+                }),
+                .failing => try w.print("   to turn it off, run: {s} disable {s}\n", .{ command, entry.name }),
+                else => {},
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn writeJoined(w: *std.Io.Writer, names: []const []const u8) !void {
+        if (names.len == 0) return w.writeAll("(none)");
+        for (names, 0..) |name, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll(name);
+        }
+    }
+
+    pub fn renderJson(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
+        const Entry = struct {
+            name: []const u8,
+            version: []const u8,
+            state: []const u8,
+            runs: bool,
+            events: []const []const u8,
+            scopes: []const []const u8,
+            kv: bool,
+            memory_mb: usize,
+            instructions_per_call: u32,
+            files: usize,
+            sha256: []const u8,
+            changed_files: []const []const u8,
+            failures: u64,
+            last_error: ?[]const u8,
+            problem: ?[]const u8,
+        };
+        const entries = try alloc.alloc(Entry, self.listing.entries.len);
+        defer alloc.free(entries);
+        for (self.listing.entries, entries) |entry, *json| {
+            json.* = .{
+                .name = entry.name,
+                .version = entry.version,
+                .state = @tagName(entry.state),
+                .runs = entry.state.runs(),
+                .events = entry.events,
+                .scopes = entry.scopes,
+                .kv = entry.kv,
+                .memory_mb = entry.memory_mb,
+                .instructions_per_call = entry.instructions_per_call,
+                .files = entry.file_count,
+                .sha256 = entry.sha256,
+                .changed_files = entry.changed_files,
+                .failures = entry.failures,
+                .last_error = entry.last_error,
+                .problem = entry.problem,
+            };
+        }
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(.{
+            .kind = "extensions",
+            .action = self.listing.action.verb(),
+            .target = self.listing.action.target(),
+            .directory = self.listing.directory,
+            .extensions = entries,
+        }, .{}, &out.writer);
+        return try out.toOwnedSlice();
+    }
+};
+
+test "extensions snapshot renders text and JSON from one listing" {
+    const alloc = std.testing.allocator;
+    var listing: lua_host.Listing = .{
+        .arena = .init(alloc),
+        .directory = "/Users/example/.fx/extensions",
+        .action = .{ .trust = "policy" },
+        .entries = &.{
+            .{
+                .name = "policy",
+                .version = "0.1.0",
+                .state = .trusted,
+                .events = &.{"pre_tool_use"},
+                .scopes = &.{ "interactive", "ask" },
+                .memory_mb = 4,
+                .instructions_per_call = 5000000,
+                .file_count = 2,
+                .sha256 = "abc",
+            },
+            .{ .name = "broken", .state = .invalid, .problem = "manifest.lua is missing" },
+            .{ .name = "fresh", .state = .needs_review, .events = &.{"stop"}, .scopes = &.{"ask"}, .changed_files = &.{"main.lua"} },
+        },
+    };
+    defer listing.deinit();
+    const snapshot: ExtensionsSnapshot = .{ .listing = &listing };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        \\[extensions] directory=/Users/example/.fx/extensions
+        \\[extensions] trusted policy; this takes effect the next time fx starts
+        \\[extensions] extensions:
+        \\ - policy 0.1.0 state=trusted hooks=pre_tool_use scopes=interactive,ask memory_mb=4 instructions_per_call=5000000 kv=false files=2
+        \\ - broken state=invalid
+        \\   problem: manifest.lua is missing
+        \\ - fresh state=needs_review hooks=stop scopes=ask memory_mb=0 instructions_per_call=0 kv=false files=0
+        \\   changed since trusted: main.lua
+        \\   review its files in /Users/example/.fx/extensions/fresh, then run: fx extensions trust fresh
+        \\
+    , text);
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("trust", parsed.value.object.get("action").?.string);
+    try std.testing.expectEqualStrings("policy", parsed.value.object.get("target").?.string);
+    const first = parsed.value.object.get("extensions").?.array.items[0].object;
+    try std.testing.expectEqualStrings("trusted", first.get("state").?.string);
+    try std.testing.expect(first.get("runs").?.bool);
+    try std.testing.expectEqual(@as(i64, 5000000), first.get("instructions_per_call").?.integer);
 }
 
 pub const WorkspaceSnapshot = struct {

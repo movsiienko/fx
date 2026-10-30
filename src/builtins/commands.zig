@@ -276,6 +276,23 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
+    .{
+        .kind = .extensions,
+        .token = "extensions",
+        .usage = "extensions [list|trust NAME|disable NAME|enable NAME] [--json]",
+        .summary = "Review and trust Lua hook extensions",
+        .options = &.{
+            .{ .flag = "list", .description = "List the extensions in ~/.fx/extensions and their state (default)" },
+            .{ .flag = "trust NAME", .description = "Trust an extension's current files so its hooks run" },
+            .{ .flag = "disable NAME", .description = "Switch an extension off without deleting it" },
+            .{ .flag = "enable NAME", .description = "Switch a disabled extension back on" },
+            json_option,
+        },
+        .details = &.{
+            "An extension runs only after you trust its current files; any change sends it back for review.",
+            "A change takes effect the next time fx starts.",
+        },
+    },
     command_specs.slack_install_spec,
 };
 
@@ -317,6 +334,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
+        .{ .kind = .extensions, .usage = "extensions" },
         .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
@@ -461,6 +479,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .extensions, .command = "/extensions", .help_entry = "/extensions [list|trust NAME|disable NAME|enable NAME]", .completion_description = "review and trust Lua hook extensions", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -551,6 +570,7 @@ test "built-in slash commands register exact active order" {
         "/allowlist",
         "/undo",
         "/mcp",
+        "/extensions",
         "/skills",
         "/copy",
         "/feedback",

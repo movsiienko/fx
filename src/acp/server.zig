@@ -24,6 +24,7 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
+const lua_host = @import("../core/lua_host/lua_host.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -369,6 +370,7 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    lua_hooks: lua_host.Hooks = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
@@ -410,6 +412,7 @@ pub const ServerState = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
+        self.lua_hooks.deinit();
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
@@ -870,6 +873,12 @@ pub fn runWithTransport(
     }
 
     var lifecycle_runtime = hooks.Runtime.init(alloc);
+    var lua_hooks: lua_host.Hooks = .{};
+    _ = lua_hooks.register(alloc, &lifecycle_runtime, .{ .home = cfg.home_override }) catch |err| {
+        lua_hooks.deinit();
+        lifecycle_runtime.deinit();
+        return err;
+    };
     const lifecycle_view = lifecycle_runtime.freeze();
     var state = ServerState{
         .alloc = alloc,
@@ -884,6 +893,7 @@ pub fn runWithTransport(
         .managed_executions = managed_execution.Runtime.init(alloc),
         .lifecycle_runtime = lifecycle_runtime,
         .lifecycle_view = lifecycle_view,
+        .lua_hooks = lua_hooks,
     };
     defer state.deinit();
     // The wasm host keeps its sessions in the JS host's store (D63).
