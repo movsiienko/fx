@@ -157,8 +157,13 @@ fn apply(gpa: Allocator, home: []const u8, catalog: *catalog_mod.Catalog, action
     const extension = catalog.find(name) orelse return error.UnknownExtension;
     const mutation: settings_store.ExtensionMutation = switch (action) {
         .list => unreachable,
-        .trust => blk: {
+        .trust => |trust| blk: {
             if (extension.state == .invalid) return error.ExtensionInvalid;
+            // Pins trust to the files the user reviewed, not whatever is
+            // on disk by the time they run trust.
+            if (trust.sha256) |reviewed| {
+                if (!std.mem.startsWith(u8, extension.sha256, reviewed)) return error.ExtensionChanged;
+            }
             break :blk .{ .name = name, .action = .{ .trust = .{
                 .sha256 = extension.sha256,
                 .files = extension.hashes,
@@ -238,7 +243,7 @@ test "only trusted extensions register, and their hooks run through fx's runtime
         try std.testing.expect(!runtime.freeze().hasPreToolUse());
     }
 
-    var trusted = try execute(std.testing.allocator, .{ .trust = "policy" }, home.home);
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
     try std.testing.expectEqual(listing.State.trusted, trusted.find("policy").?.state);
     trusted.deinit();
 
@@ -293,7 +298,7 @@ test "disable and enable switch a trusted extension without forgetting its revie
     var result = try execute(std.testing.allocator, .{ .disable = "policy" }, home.home);
     try std.testing.expectEqual(listing.State.needs_review, result.find("policy").?.state);
     result.deinit();
-    result = try execute(std.testing.allocator, .{ .trust = "policy" }, home.home);
+    result = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
     try std.testing.expectEqual(listing.State.trusted, result.find("policy").?.state);
     result.deinit();
     result = try execute(std.testing.allocator, .{ .disable = "policy" }, home.home);
@@ -302,7 +307,26 @@ test "disable and enable switch a trusted extension without forgetting its revie
     result = try execute(std.testing.allocator, .{ .enable = "policy" }, home.home);
     try std.testing.expectEqual(listing.State.trusted, result.find("policy").?.state);
     result.deinit();
-    try std.testing.expectError(error.UnknownExtension, execute(std.testing.allocator, .{ .trust = "absent" }, home.home));
+    try std.testing.expectError(error.UnknownExtension, execute(std.testing.allocator, .{ .trust = .{ .name = "absent" } }, home.home));
+}
+
+test "trust with a digest refuses files that changed since they were listed" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var reviewed = try execute(std.testing.allocator, .list, home.home);
+    const prefix = try std.testing.allocator.dupe(u8, reviewed.find("policy").?.sha256[0..12]);
+    defer std.testing.allocator.free(prefix);
+    reviewed.deinit();
+
+    try home.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/extensions/policy/main.lua", .data = "-- weakened\n" });
+    try std.testing.expectError(error.ExtensionChanged, execute(std.testing.allocator, .{ .trust = .{ .name = "policy", .sha256 = prefix } }, home.home));
+    var after = try execute(std.testing.allocator, .list, home.home);
+    defer after.deinit();
+    try std.testing.expectEqual(listing.State.needs_review, after.find("policy").?.state);
+
+    var current = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy", .sha256 = after.find("policy").?.sha256[0..12] } }, home.home);
+    defer current.deinit();
+    try std.testing.expectEqual(listing.State.trusted, current.find("policy").?.state);
 }
 
 test "an extensions folder that cannot be read is reported at session start" {

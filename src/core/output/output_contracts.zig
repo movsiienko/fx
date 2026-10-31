@@ -492,6 +492,7 @@ pub const ExtensionsSnapshot = struct {
                     entry.kv,
                     entry.file_count,
                 });
+                if (entry.sha256.len > 0) try w.print(" sha256={s}", .{entry.digestPrefix()});
             }
             try w.writeByte('\n');
             if (entry.changed_files.len > 0) {
@@ -523,6 +524,8 @@ pub const ExtensionsSnapshot = struct {
                     try writeTerminalSafe(w, alloc, entry.name);
                     try w.print(", then run: {s} trust ", .{command});
                     try writeTerminalSafe(w, alloc, entry.name);
+                    // The digest pins trust to the files just listed.
+                    if (entry.sha256.len > 0) try w.print(" {s}", .{entry.digestPrefix()});
                     try w.writeByte('\n');
                 },
                 .failing => {
@@ -601,7 +604,7 @@ test "extensions snapshot renders text and JSON from one listing" {
     var listing: lua_host.Listing = .{
         .arena = .init(alloc),
         .directory = "/Users/example/.fx/extensions",
-        .action = .{ .trust = "policy" },
+        .action = .{ .trust = .{ .name = "policy" } },
         .entries = &.{
             .{
                 .name = "policy",
@@ -612,10 +615,17 @@ test "extensions snapshot renders text and JSON from one listing" {
                 .memory_mb = 4,
                 .instructions_per_call = 5000000,
                 .file_count = 2,
-                .sha256 = "abc",
+                .sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             },
             .{ .name = "broken", .state = .invalid, .problem = "manifest.lua is missing" },
-            .{ .name = "fresh", .state = .needs_review, .events = &.{"stop"}, .scopes = &.{"ask"}, .changed_files = &.{"main.lua"} },
+            .{
+                .name = "fresh",
+                .state = .needs_review,
+                .events = &.{"stop"},
+                .scopes = &.{"ask"},
+                .sha256 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                .changed_files = &.{"main.lua"},
+            },
         },
     };
     defer listing.deinit();
@@ -627,14 +637,17 @@ test "extensions snapshot renders text and JSON from one listing" {
         \\[extensions] directory=/Users/example/.fx/extensions
         \\[extensions] trusted policy; this takes effect the next time fx starts
         \\[extensions] extensions:
-        \\ - policy 0.1.0 state=trusted hooks=pre_tool_use scopes=interactive,ask memory_mb=4 instructions_per_call=5000000 kv=false files=2
+        \\ - policy 0.1.0 state=trusted hooks=pre_tool_use scopes=interactive,ask memory_mb=4 instructions_per_call=5000000 kv=false files=2 sha256=0123456789ab
         \\ - broken state=invalid
         \\   problem: manifest.lua is missing
-        \\ - fresh state=needs_review hooks=stop scopes=ask memory_mb=0 instructions_per_call=0 kv=false files=0
+        \\ - fresh state=needs_review hooks=stop scopes=ask memory_mb=0 instructions_per_call=0 kv=false files=0 sha256=fedcba987654
         \\   changed since trusted: main.lua
-        \\   review its files in /Users/example/.fx/extensions/fresh, then run: fx extensions trust fresh
+        \\   review its files in /Users/example/.fx/extensions/fresh, then run: fx extensions trust fresh fedcba987654
         \\
     , text);
+    const body = try snapshot.renderInteractiveBody(alloc);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.endsWith(u8, body, ", then run: /extensions trust fresh fedcba987654"));
 
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);

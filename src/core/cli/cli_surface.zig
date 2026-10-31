@@ -3455,7 +3455,7 @@ const ExtensionsOptions = struct {
 };
 
 fn parseExtensionsArgs(args: []const [:0]const u8) !ExtensionsOptions {
-    var words: [2][]const u8 = undefined;
+    var words: [3][]const u8 = undefined;
     var word_count: usize = 0;
     var options = ExtensionsOptions{};
     for (args) |arg| {

@@ -1387,10 +1387,10 @@ pub fn Handlers(comptime App: type) type {
     };
 }
 
-const extensions_usage = "Usage: /extensions [list|trust NAME|disable NAME|enable NAME]";
+const extensions_usage = "Usage: /extensions [list|trust NAME [SHA256]|disable NAME|enable NAME]";
 
 fn handleExtensionsCommand(app: anytype, rest: []const u8) !void {
-    var words: [2][]const u8 = undefined;
+    var words: [3][]const u8 = undefined;
     var word_count: usize = 0;
     var tokens = std.mem.tokenizeAny(u8, rest, " \t");
     while (tokens.next()) |token| {

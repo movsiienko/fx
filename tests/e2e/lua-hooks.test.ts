@@ -266,7 +266,35 @@ describe("Lua extension hooks", () => {
         expect(text.stdout).toContain("[extensions] extensions:");
         expect(text.stdout).toContain(" - policy 0.1.0 state=needs_review");
         expect(text.stdout).toContain("changed since trusted: main.lua");
-        expect(text.stdout).toContain("then run: fx extensions trust policy");
+        const prefix = listed.json.extensions[0].sha256.slice(0, 12);
+        expect(text.stdout).toContain(`files=2 sha256=${prefix}\n`);
+        expect(text.stdout).toContain(`then run: fx extensions trust policy ${prefix}\n`);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "trust with a digest refuses files that changed after they were listed",
+    async () => {
+      const root = createRoot();
+      try {
+        const reviewed = await extensions(root, ["list"]);
+        const prefix = reviewed.json.extensions[0].sha256.slice(0, 12);
+        writeFileSync(join(root.extension, "main.lua"), "-- swapped after review\n");
+
+        const refused = await extensions(root, ["trust", "policy", prefix]);
+        expect(refused.code).not.toBe(0);
+        expect(refused.json).toMatchObject({ kind: "extensions", code: "ExtensionChanged" });
+        const listed = await extensions(root, ["list"]);
+        expect(listed.json.extensions[0]).toMatchObject({ state: "needs_review", runs: false });
+
+        const current = listed.json.extensions[0].sha256.slice(0, 12);
+        const trusted = await extensions(root, ["trust", "policy", current]);
+        expect(trusted.code).toBe(0);
+        expect(trusted.json.extensions[0]).toMatchObject({ state: "trusted", runs: true });
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
@@ -293,7 +321,7 @@ describe("Lua extension hooks", () => {
 
         const usage = await runFx(["extensions", "remove", "policy"], { cwd: root.workspace, env: env(root), timeoutMs: TIMEOUT });
         expect(usage.code).not.toBe(0);
-        expect(usage.stderr).toContain("extensions [list|trust NAME|disable NAME|enable NAME]");
+        expect(usage.stderr).toContain("extensions [list|trust NAME [SHA256]|disable NAME|enable NAME]");
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
