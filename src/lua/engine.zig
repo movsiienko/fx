@@ -165,19 +165,19 @@ pub const Extension = struct {
         return self.refs.get(event) != c.LUA_NOREF;
     }
 
-    /// Calls the extension's handler for `event` with the JSON value
-    /// `input_json` and returns what the handler returned, encoded as JSON,
-    /// or null when it returned nothing. `arena` holds the parsed input and
-    /// the result, so only the Lua copy of the input counts against the
-    /// extension's memory limit. Safe to call from several threads; calls
-    /// into one extension run one at a time.
+    /// Calls the extension's handler for `event` with the JSON value `input`
+    /// and returns what the handler returned as a JSON value allocated in
+    /// `arena`, or null when it returned nothing. The result is at most
+    /// `max_result_bytes` as JSON. Only the Lua copy of the input counts
+    /// against the extension's memory limit. Safe to call from several
+    /// threads; calls into one extension run one at a time.
     pub fn call(
         self: *Extension,
         arena: Allocator,
         event: Event,
-        input_json: []const u8,
+        input: std.json.Value,
         diagnostic: *Diagnostic,
-    ) CallError!?[]u8 {
+    ) CallError!?std.json.Value {
         const ref = self.refs.get(event);
         std.debug.assert(ref != c.LUA_NOREF);
         self.mutex.lockUncancelable(self.io);
@@ -187,9 +187,9 @@ pub const Extension = struct {
         defer c.lua_settop(L, 0);
         // Scratch memory counts against the budget, so keep little of it.
         _ = self.scratch.reset(.{ .retain_with_limit = 64 * 1024 });
-        const input = std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{}) catch |err| {
-            diagnostic.print("hook input is not valid JSON ({s})", .{@errorName(err)});
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidInput;
+        bridge.checkValue(input) catch |err| {
+            diagnostic.print("hook input is not valid JSON ({s})", .{bridge.describe(err)});
+            return error.InvalidInput;
         };
 
         var job = CallJob{ .ext = self, .ref = ref, .input = input };
@@ -199,12 +199,10 @@ pub const Extension = struct {
         };
         if (c.lua_type(L, -1) == c.LUA_TNIL) return null;
 
-        var out: std.Io.Writer.Allocating = .init(arena);
-        bridge.encode(L, self.tags, -1, &out, max_result_bytes) catch |err| {
+        return bridge.toValue(L, self.tags, -1, arena, max_result_bytes) catch |err| {
             diagnostic.print("the hook's return value is not valid: {s}", .{bridge.describe(err)});
             return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidResult;
         };
-        return out.written();
     }
 
     /// Runs `function(job)` as a protected call under the instruction
@@ -554,16 +552,20 @@ fn loadForTest(main: []const u8, extra: []const SourceFile, options: struct {
     };
 }
 
+/// Calls with the JSON text `input` and compares the result as JSON text.
 fn expectCall(ext: *Extension, event: Event, input: []const u8, expected: ?[]const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{});
     var diagnostic: Diagnostic = .{};
-    const result = ext.call(arena.allocator(), event, input, &diagnostic) catch |err| {
+    const result = ext.call(arena.allocator(), event, value, &diagnostic) catch |err| {
         std.debug.print("call failed: {s}\n", .{diagnostic.message()});
         return err;
     };
     if (expected) |want| {
-        try std.testing.expectEqualStrings(want, result orelse return error.TestUnexpectedResult);
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        try std.json.Stringify.value(result orelse return error.TestUnexpectedResult, .{}, &out.writer);
+        try std.testing.expectEqualStrings(want, out.written());
     } else {
         try std.testing.expect(result == null);
     }
@@ -572,8 +574,13 @@ fn expectCall(ext: *Extension, event: Event, input: []const u8, expected: ?[]con
 fn expectCallFails(ext: *Extension, event: Event, input: []const u8, expected: CallError, message: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{});
+    try expectValueCallFails(ext, arena.allocator(), event, value, expected, message);
+}
+
+fn expectValueCallFails(ext: *Extension, arena: Allocator, event: Event, input: std.json.Value, expected: CallError, message: []const u8) !void {
     var diagnostic: Diagnostic = .{};
-    try std.testing.expectError(expected, ext.call(arena.allocator(), event, input, &diagnostic));
+    try std.testing.expectError(expected, ext.call(arena, event, input, &diagnostic));
     if (std.mem.find(u8, diagnostic.message(), message) == null) {
         std.debug.print("unexpected diagnostic: {s}\n", .{diagnostic.message()});
         return error.TestUnexpectedResult;
@@ -626,6 +633,33 @@ test "values keep their JSON shape across the bridge" {
     try expectCall(ext, .stop, "{}",
         \\{"continue":"[[],true,2.5]"}
     );
+}
+
+test "a large string argument reaches Lua and comes back intact" {
+    const ext = try loadForTest(
+        \\agent.on("pre_tool_use", function(ev)
+        \\  return { arguments = { content = ev.arguments.content, length = #ev.arguments.content } }
+        \\end)
+    , &.{}, .{ .limits = .{ .memory_bytes = 8 * 1024 * 1024, .instructions_per_call = 200_000 } });
+    defer ext.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const content = try arena.alloc(u8, 1536 * 1024);
+    @memset(content, 'x');
+    var arguments: std.json.ObjectMap = .empty;
+    try arguments.put(arena, "content", .{ .string = content });
+    var input: std.json.ObjectMap = .empty;
+    try input.put(arena, "arguments", .{ .object = arguments });
+
+    var diagnostic: Diagnostic = .{};
+    const result = (try ext.call(arena, .pre_tool_use, .{ .object = input }, &diagnostic)).?;
+    const returned = result.object.get("arguments").?.object;
+    try std.testing.expectEqual(@as(i64, 1572864), returned.get("length").?.integer);
+    const echoed = returned.get("content").?.string;
+    try std.testing.expectEqual(@as(usize, 1572864), echoed.len);
+    try std.testing.expect(std.mem.allEqual(u8, echoed, 'x'));
 }
 
 test "the sandbox leaves out unsafe libraries and binary chunks" {
@@ -866,7 +900,13 @@ test "invalid return values and inputs are reported" {
     try expectCallFails(ext, .stop, "{}", error.InvalidResult, "only nil, booleans");
     try expectCallFails(ext, .pre_tool_use, "{}", error.InvalidResult, "only the keys 1..n");
     try expectCallFails(ext, .post_turn_end, "{}", error.InvalidResult, "NaN");
-    try expectCallFails(ext, .post_turn_end, "{", error.InvalidInput, "not valid JSON");
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var input: std.json.ObjectMap = .empty;
+    try input.put(arena.allocator(), "text", .{ .string = "\xff" });
+    try expectValueCallFails(ext, arena.allocator(), .post_turn_end, .{ .object = input }, error.InvalidInput, "not valid JSON");
+    try expectValueCallFails(ext, arena.allocator(), .post_turn_end, .{ .float = std.math.inf(f64) }, error.InvalidInput, "not valid JSON");
 }
 
 test "the value bridge round-trips fuzzed JSON" {
@@ -890,26 +930,25 @@ fn fuzzValueBridge(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{}) catch return;
 
-    var wrapped: std.Io.Writer.Allocating = .init(arena.allocator());
-    try wrapped.writer.writeAll("{\"v\":");
-    try std.json.Stringify.value(parsed, .{}, &wrapped.writer);
-    try wrapped.writer.writeAll("}");
+    var wrapped: std.json.ObjectMap = .empty;
+    try wrapped.put(arena.allocator(), "v", parsed);
 
     const ext = try loadForTest(
         \\agent.on("stop", function(ev) return ev.v end)
     , &.{}, .{});
     defer ext.deinit();
     var diagnostic: Diagnostic = .{};
-    const result = ext.call(arena.allocator(), .stop, wrapped.written(), &diagnostic) catch |err| switch (err) {
+    const result = ext.call(arena.allocator(), .stop, .{ .object = wrapped }, &diagnostic) catch |err| switch (err) {
         // Nesting past the bridge's depth limit is refused, not crashed on.
         error.HookFailed, error.InvalidResult => return,
         else => return err,
     };
-    // JSON null arrives as agent.json.null, which encodes back as null.
-    const bytes = result orelse return error.TestUnexpectedResult;
-    const round_trip = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{});
+    // JSON null arrives as agent.json.null, which converts back to null.
+    const round_trip = result orelse return error.TestUnexpectedResult;
     if (!jsonEquivalent(parsed, round_trip)) {
-        std.debug.print("bridge changed {s} into {s}\n", .{ wrapped.written(), bytes });
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        try std.json.Stringify.value(round_trip, .{}, &out.writer);
+        std.debug.print("bridge changed {s} into {s}\n", .{ input, out.written() });
         return error.TestUnexpectedResult;
     }
 }

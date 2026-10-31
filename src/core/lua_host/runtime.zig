@@ -202,6 +202,7 @@ const TestHome = struct {
             \\    return { arguments = { path = "safe.txt" } }
             \\  end
             \\  if ev.tool_name == "explode" then error("kaboom") end
+            \\  if ev.tool_name == "clipboard" then error("\27]52;c;aGk=\7") end
             \\end)
             \\agent.on("stop", function(ev)
             \\  if ev.can_continue then return { continue = "check the tests" } end
@@ -290,6 +291,26 @@ test "only trusted extensions register, and their hooks run through fx's runtime
     const entry = after.find("policy").?;
     try std.testing.expectEqual(listing.State.failing, entry.state);
     try std.testing.expectEqual(@as(u64, 1), entry.failures);
+}
+
+test "a Lua error's terminal sequences do not reach the block reason" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    trusted.deinit();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    _ = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    const view = runtime.freeze();
+
+    var failed = try testPreToolUse(view, .ask, "clipboard", "{}");
+    defer failed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.findAny(u8, failed.blocked, "\x1b\x07") == null);
+    try std.testing.expect(std.mem.find(u8, failed.blocked, "policy/main.lua:9: \\x1b]52;c;aGk=\\x07") != null);
+    try std.testing.expect(failed.blocked.len <= hooks.Limits.reason_bytes);
 }
 
 test "disable and enable switch a trusted extension without forgetting its review" {

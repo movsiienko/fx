@@ -14,6 +14,7 @@ const engine = @import("../../lua/engine.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const catalog = @import("catalog.zig");
 
 const Allocator = std.mem.Allocator;
@@ -127,18 +128,14 @@ pub const LuaHook = struct {
 
     /// Calls the Lua handler. A failure is counted and its reason returned.
     fn call(self: *LuaHook, arena: Allocator, input: anytype) CallOutcome {
-        var out: std.Io.Writer.Allocating = .init(arena);
-        std.json.Stringify.value(input, .{ .emit_null_optional_fields = false }, &out.writer) catch
+        const value = inputValue(arena, input) catch
             return self.failed(arena, "not enough memory to build the hook input");
         var diagnostic: engine.Diagnostic = .{};
-        const result = self.loaded.lua.call(arena, self.event, out.written(), &diagnostic) catch |err| {
+        const result = self.loaded.lua.call(arena, self.event, value, &diagnostic) catch |err| {
             if (err == error.OutOfMemory) return self.failed(arena, "not enough memory");
             return self.failed(arena, diagnostic.message());
         };
-        const bytes = result orelse return .{ .value = .null };
-        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch
-            return self.failed(arena, "the hook returned a value fx cannot read");
-        return .{ .value = value };
+        return .{ .value = result orelse .null };
     }
 
     fn failed(self: *LuaHook, arena: Allocator, message: []const u8) CallOutcome {
@@ -153,10 +150,14 @@ pub const LuaHook = struct {
     }
 
     /// The block reason for a failed `PreToolUse` hook, within fx's limit.
+    /// The reason reaches the model and the transcript, and a Lua error may
+    /// hold any bytes, so its control bytes become visible escapes.
     fn failClosed(self: *LuaHook, arena: Allocator, message: []const u8) hooks.HandlerError!hooks.PreToolUseAction {
+        const safe_message = text_utils.encodeTerminalSafe(arena, message, hooks.Limits.reason_bytes) catch
+            return error.Failed;
         const reason = arena.print(
             "Lua hook {s} failed, so fx blocked this tool call: {s}. Turn the extension off with `fx extensions disable {s}`.",
-            .{ self.name(), message, self.loaded.name },
+            .{ self.name(), safe_message.bytes, self.loaded.name },
         ) catch return error.Failed;
         return .{ .block = try self.keep(truncateUtf8(reason, hooks.Limits.reason_bytes)) };
     }
@@ -167,6 +168,36 @@ pub const LuaHook = struct {
         return self.results.keep(self.loaded.gpa, bytes) catch error.Failed;
     }
 };
+
+/// Builds a hook input as a JSON value, leaving out optional fields that are
+/// null. Strings and embedded values point at the input's own memory, so a
+/// large argument is not copied before it reaches Lua.
+fn inputValue(arena: Allocator, input: anytype) Allocator.Error!std.json.Value {
+    const T = @TypeOf(input);
+    if (T == std.json.Value) return input;
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            var object: std.json.ObjectMap = .empty;
+            try object.ensureTotalCapacity(arena, info.field_names.len);
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                const field_value = @field(input, field_name);
+                if (@typeInfo(field_type) == .optional) {
+                    if (field_value) |present| object.putAssumeCapacity(field_name, try inputValue(arena, present));
+                } else {
+                    object.putAssumeCapacity(field_name, try inputValue(arena, field_value));
+                }
+            }
+            return .{ .object = object };
+        },
+        .pointer => return .{ .string = input },
+        .bool => return .{ .bool = input },
+        .int, .comptime_int => return if (std.math.cast(i64, input)) |integer|
+            .{ .integer = integer }
+        else
+            .{ .number_string = try arena.print("{d}", .{input}) },
+        else => @compileError("no JSON form for " ++ @typeName(T)),
+    }
+}
 
 const CallOutcome = union(enum) {
     value: std.json.Value,
