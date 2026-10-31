@@ -354,7 +354,7 @@ test "an extensions folder that cannot be read is reported at session start" {
 test "failures from concurrent hook calls are all counted and outlive the session" {
     var home = try TestHome.init();
     defer home.deinit();
-    var trusted = try execute(std.testing.allocator, .{ .trust = "policy" }, home.home);
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
     trusted.deinit();
 
     var runtime = hooks.Runtime.init(std.testing.allocator);
