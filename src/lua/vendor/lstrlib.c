@@ -683,18 +683,31 @@ static const char *match (MatchState *ms, const char *s, const char *p) {
 
 
 
-static const char *lmemfind (const char *s1, size_t l1,
+/*
+** fx: a plain search runs inside one C call, where the instruction budget
+** cannot stop it, and a needle that nearly matches at every position of a
+** long string costs the product of their lengths. So 'lmemfind' compares
+** by hand and counts against MAXMATCHSTEPS the bytes past the first that
+** match in each failed try. The uncounted work is one step per position
+** plus the try that succeeds, so it stays linear in the two lengths.
+*/
+static const char *lmemfind (lua_State *L, const char *s1, size_t l1,
                                const char *s2, size_t l2) {
   if (l2 == 0) return s1;  /* empty strings are everywhere */
   else if (l2 > l1) return NULL;  /* avoids a negative 'l1' */
   else {
     const char *init;  /* to search for a '*s2' inside 's1' */
+    long steps = MAXMATCHSTEPS;  /* fx */
     l2--;  /* 1st char will be checked by 'memchr' */
     l1 = l1-l2;  /* 's2' cannot be found after that */
     while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
+      size_t i = 0;  /* fx: bytes of this try that match */
       init++;   /* 1st char is already checked */
-      if (memcmp(init, s2+1, l2) == 0)
+      while (i < l2 && init[i] == s2[i+1]) i++;
+      if (i == l2)
         return init-1;
+      else if (l_unlikely((steps -= (long)i) < 0))  /* fx */
+        luaL_error(L, "pattern too complex");
       else {  /* correct 'l1' and 's1' to try again */
         l1 -= init-s1;
         s1 = init;
@@ -796,7 +809,7 @@ static int str_find_aux (lua_State *L, int find) {
   /* explicit request or no special characters? */
   if (find && (lua_toboolean(L, 4) || nospecials(p, lp))) {
     /* do a plain search */
-    const char *s2 = lmemfind(s + init, ls - init, p, lp);
+    const char *s2 = lmemfind(L, s + init, ls - init, p, lp);
     if (s2) {
       lua_pushinteger(L, (s2 - s) + 1);
       lua_pushinteger(L, (s2 - s) + lp);

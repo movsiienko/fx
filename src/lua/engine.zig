@@ -723,6 +723,49 @@ test "a backtracking pattern is cut off inside its C call" {
     try expectCallFails(ext, .stop, "{}", error.HookFailed, "pattern too complex");
 }
 
+test "a worst-case plain find is cut off inside its C call" {
+    // Every position of s starts a 4 MiB near match, so a search that
+    // compares the whole needle at each one does about 2^44 byte compares.
+    const ext = try loadForTest(
+        \\local s = string.rep("a", 8 * 1024 * 1024)
+        \\local p = string.rep("a", 4 * 1024 * 1024) .. "b"
+        \\agent.on("stop", function() return { continue = tostring(s:find(p, 1, true)) } end)
+        \\agent.on("post_turn_end", function() return { continue = tostring(s:find(p)) } end)
+    , &.{}, .{ .limits = .{ .memory_bytes = 32 * 1024 * 1024, .instructions_per_call = 1_000_000 } });
+    defer ext.deinit();
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "pattern too complex");
+    try expectCallFails(ext, .post_turn_end, "{}", error.HookFailed, "pattern too complex");
+}
+
+test "plain finds return the same positions as stock Lua" {
+    const ext = try loadForTest(
+        \\local function r(...) local a, b = ... return tostring(a) .. ":" .. tostring(b) end
+        \\agent.on("stop", function()
+        \\  local long = string.rep("a", 1000000) .. "b"
+        \\  return { continue = table.concat({
+        \\    r(("hello world"):find("o", 1, true)),
+        \\    r(("hello world"):find("o", 6, true)),
+        \\    r(("hello world"):find("o", -4, true)),
+        \\    r(("hello world"):find("o", -3, true)),
+        \\    r(("hello"):find("", 1, true)),
+        \\    r(("hello"):find("", 6, true)),
+        \\    r(("hello"):find("", 7, true)),
+        \\    r(("aaab"):find("aab", 1, true)),
+        \\    r(("abc"):find("abc", 1, true)),
+        \\    r(("abc"):find("abcd", 1, true)),
+        \\    r(("a.b"):find(".", 1, true)),
+        \\    r(("foo bar"):find("bar")),
+        \\    r(("abcabc"):find("c", -1)),
+        \\    r(long:find("aab", 1, true)),
+        \\  }, " ") }
+        \\end)
+    , &.{}, .{ .limits = .{ .memory_bytes = 8 * 1024 * 1024, .instructions_per_call = 1_000_000 } });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"5:5 8:8 8:8 nil:nil 1:0 6:5 nil:nil 2:4 1:3 nil:nil 2:2 5:7 6:6 999999:1000001"}
+    );
+}
+
 test "string.rep of an empty result returns at once" {
     const ext = try loadForTest(
         \\agent.on("stop", function()
