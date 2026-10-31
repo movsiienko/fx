@@ -12,34 +12,31 @@ pub const lua_newstate = raw.lua_newstate;
 pub const lua_close = raw.lua_close;
 pub const lua_gettop = raw.lua_gettop;
 pub const lua_settop = raw.lua_settop;
-pub const lua_rotate = raw.lua_rotate;
 pub const lua_checkstack = raw.lua_checkstack;
 pub const lua_absindex = raw.lua_absindex;
 pub const lua_type = raw.lua_type;
-pub const lua_typename = raw.lua_typename;
+const lua_typename = raw.lua_typename;
 pub const lua_isinteger = raw.lua_isinteger;
 pub const lua_tointegerx = raw.lua_tointegerx;
 pub const lua_tonumberx = raw.lua_tonumberx;
 pub const lua_toboolean = raw.lua_toboolean;
-pub const lua_tolstring = raw.lua_tolstring;
+const lua_tolstring = raw.lua_tolstring;
 pub const lua_touserdata = raw.lua_touserdata;
 pub const lua_rawlen = raw.lua_rawlen;
 pub const lua_rawequal = raw.lua_rawequal;
 pub const lua_pushnil = raw.lua_pushnil;
 pub const lua_pushinteger = raw.lua_pushinteger;
 pub const lua_pushnumber = raw.lua_pushnumber;
-pub const lua_pushlstring = raw.lua_pushlstring;
+const lua_pushlstring = raw.lua_pushlstring;
 pub const lua_pushcclosure = raw.lua_pushcclosure;
 pub const lua_pushboolean = raw.lua_pushboolean;
 pub const lua_pushlightuserdata = raw.lua_pushlightuserdata;
 pub const lua_pushvalue = raw.lua_pushvalue;
-pub const lua_stringtonumber = raw.lua_stringtonumber;
 pub const lua_rawget = raw.lua_rawget;
 pub const lua_rawgeti = raw.lua_rawgeti;
 pub const lua_rawset = raw.lua_rawset;
 pub const lua_rawseti = raw.lua_rawseti;
 pub const lua_setfield = raw.lua_setfield;
-pub const lua_getfield = raw.lua_getfield;
 pub const lua_setglobal = raw.lua_setglobal;
 pub const lua_getglobal = raw.lua_getglobal;
 pub const lua_createtable = raw.lua_createtable;
@@ -48,11 +45,9 @@ pub const lua_setmetatable = raw.lua_setmetatable;
 pub const lua_next = raw.lua_next;
 pub const lua_error = raw.lua_error;
 pub const lua_sethook = raw.lua_sethook;
-pub const lua_concat = raw.lua_concat;
 pub const luaL_requiref = raw.luaL_requiref;
 pub const luaL_loadbufferx = raw.luaL_loadbufferx;
 pub const luaL_ref = raw.luaL_ref;
-pub const luaL_unref = raw.luaL_unref;
 pub const luaL_tolstring = raw.luaL_tolstring;
 pub const luaopen_base = raw.luaopen_base;
 pub const luaopen_string = raw.luaopen_string;
@@ -62,7 +57,6 @@ pub const luaopen_utf8 = raw.luaopen_utf8;
 
 pub const LUA_OK = 0;
 pub const LUA_ERRMEM = 4;
-pub const LUA_MULTRET = -1;
 
 pub const LUA_TNONE = -1;
 pub const LUA_TNIL = 0;
@@ -79,7 +73,6 @@ pub const LUA_NOREF = -2;
 /// `LUAI_MAXSTACK` in the vendored `luaconf.h`.
 const luai_maxstack = 1000000;
 pub const LUA_REGISTRYINDEX = -luai_maxstack - 1000;
-pub const LUA_RIDX_GLOBALS = 2;
 
 pub fn upvalueIndex(i: c_int) c_int {
     return LUA_REGISTRYINDEX - i;
@@ -99,10 +92,6 @@ pub fn pushCFunction(L: ?*State, f: CFunction) void {
 
 pub fn pushString(L: ?*State, bytes: []const u8) void {
     _ = lua_pushlstring(L, bytes.ptr, bytes.len);
-}
-
-pub fn pushGlobalTable(L: ?*State) void {
-    _ = lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
 }
 
 pub fn pcall(L: ?*State, nargs: c_int, nresults: c_int) c_int {

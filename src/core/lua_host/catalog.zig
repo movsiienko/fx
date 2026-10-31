@@ -19,9 +19,9 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const extensions_dir_name = "extensions";
-pub const failures_dir_name = "extension-failures";
-pub const manifest_file = "manifest.lua";
-pub const kv_file = "state.json";
+const failures_dir_name = "extension-failures";
+const manifest_file = "manifest.lua";
+const kv_file = "state.json";
 
 const max_files = settings_store.max_extension_files;
 const max_file_bytes = 1024 * 1024;
@@ -29,9 +29,9 @@ const max_total_bytes = 4 * 1024 * 1024;
 const max_depth = 4;
 const max_failure_record_bytes = 16 * 1024;
 
-pub const Hex = [Sha256.digest_length * 2]u8;
+const Hex = [Sha256.digest_length * 2]u8;
 
-pub const Extension = struct {
+const Extension = struct {
     name: []const u8,
     files: []const engine.SourceFile = &.{},
     hashes: []const settings_store.ExtensionFileHash = &.{},

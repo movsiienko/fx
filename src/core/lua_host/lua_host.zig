@@ -13,16 +13,13 @@ const build_options = @import("build_options");
 const text_utils = @import("../shared/text_utils.zig");
 const listing = @import("listing.zig");
 
-pub const enabled = build_options.lua_hooks;
+const enabled = build_options.lua_hooks;
 const impl = if (enabled) @import("runtime.zig") else @import("disabled.zig");
 
 pub const Hooks = impl.Hooks;
-pub const RegisterOptions = impl.RegisterOptions;
-pub const Summary = impl.Summary;
+const Summary = impl.Summary;
 pub const execute = impl.execute;
 
-pub const State = listing.State;
-pub const Entry = listing.Entry;
 pub const Action = listing.Action;
 pub const Listing = listing.Listing;
 pub const parseAction = listing.parseAction;

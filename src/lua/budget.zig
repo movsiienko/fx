@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
 /// `max_align_t` on every target fx embeds Lua in.
-pub const lua_alignment: Alignment = .@"16";
+const lua_alignment: Alignment = .@"16";
 
 pub const Budget = struct {
     gpa: Allocator,

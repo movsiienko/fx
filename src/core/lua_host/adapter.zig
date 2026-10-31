@@ -100,7 +100,7 @@ const FailureLog = struct {
     last_write_ms: ?i64 = null,
 };
 
-pub const LuaHook = struct {
+const LuaHook = struct {
     loaded: *Loaded = undefined,
     event: engine.Event = .pre_tool_use,
     name_buffer: [hooks.Limits.handler_name_bytes]u8 = undefined,

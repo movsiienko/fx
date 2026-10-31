@@ -14,7 +14,7 @@ const listing = @import("listing.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const RegisterOptions = struct {
+const RegisterOptions = struct {
     /// The profile home; null reads `HOME`.
     home: ?[]const u8 = null,
 };
@@ -30,12 +30,12 @@ pub const Summary = struct {
     unreadable_folder: ?UnreadableFolder = null,
 };
 
-pub const LoadFailure = struct {
+const LoadFailure = struct {
     name: []const u8,
     message: []const u8,
 };
 
-pub const UnreadableFolder = struct {
+const UnreadableFolder = struct {
     path: []const u8,
     /// The error name, such as `SymLinkLoop`.
     reason: []const u8,

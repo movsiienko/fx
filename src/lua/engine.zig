@@ -18,19 +18,18 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Event = types.Event;
-pub const EventSet = types.EventSet;
+const EventSet = types.EventSet;
 pub const Scope = types.Scope;
 pub const ScopeSet = types.ScopeSet;
-pub const Limits = types.Limits;
+const Limits = types.Limits;
 pub const Diagnostic = types.Diagnostic;
 pub const Manifest = manifest_mod.Manifest;
 pub const parseManifest = manifest_mod.parse;
 pub const validExtensionName = manifest_mod.validName;
 pub const validModulePath = manifest_mod.validModulePath;
-pub const lua_version = "5.4.8";
 
 /// The largest JSON value a hook call may return.
-pub const max_result_bytes = 2 * 1024 * 1024;
+const max_result_bytes = 2 * 1024 * 1024;
 const max_log_bytes = 2 * 1024;
 const max_module_name_bytes = 128;
 
@@ -41,14 +40,14 @@ pub const SourceFile = struct {
 
 pub const LogLevel = enum { debug, info, warn, @"error" };
 
-pub const LogSink = struct {
+const LogSink = struct {
     ctx: ?*anyopaque = null,
     write: *const fn (ctx: ?*anyopaque, extension: []const u8, level: LogLevel, message: []const u8) void = discardLog,
 
     fn discardLog(_: ?*anyopaque, _: []const u8, _: LogLevel, _: []const u8) void {}
 };
 
-pub const LoadOptions = struct {
+const LoadOptions = struct {
     name: []const u8,
     /// Every file `main` and `require` may load, plus `state.json` for
     /// `agent.kv`. The engine copies them.
@@ -60,8 +59,8 @@ pub const LoadOptions = struct {
     log: LogSink = .{},
 };
 
-pub const LoadError = error{ OutOfMemory, LoadFailed };
-pub const CallError = error{ OutOfMemory, InvalidInput, HookFailed, InvalidResult };
+const LoadError = error{ OutOfMemory, LoadFailed };
+const CallError = error{ OutOfMemory, InvalidInput, HookFailed, InvalidResult };
 
 const bootstrap =
     \\local raw_load = load

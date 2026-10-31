@@ -17,16 +17,6 @@ pub const State = enum {
     /// The folder or its manifest cannot be loaded. Does not run.
     invalid,
 
-    pub fn label(self: State) []const u8 {
-        return switch (self) {
-            .needs_review => "needs review",
-            .trusted => "trusted",
-            .disabled => "disabled",
-            .failing => "failing",
-            .invalid => "invalid",
-        };
-    }
-
     pub fn runs(self: State) bool {
         return self == .trusted or self == .failing;
     }
@@ -60,7 +50,7 @@ pub const Entry = struct {
 const digest_prefix_len = 12;
 const digest_len = 64;
 
-pub const Trust = struct {
+const Trust = struct {
     name: []const u8,
     /// The digest, or a prefix of it, of the files the user reviewed.
     /// When set, trust refuses files that no longer match it.
@@ -86,7 +76,7 @@ pub const Action = union(enum) {
     }
 };
 
-pub const ParseError = error{InvalidExtensionsArgs};
+const ParseError = error{InvalidExtensionsArgs};
 
 /// Parses `[list | trust NAME [SHA256] | disable NAME | enable NAME]`.
 pub fn parseAction(words: []const []const u8) ParseError!Action {

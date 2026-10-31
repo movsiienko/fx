@@ -27,13 +27,13 @@ pub const Manifest = struct {
 };
 
 /// Hooks skip subagents unless the manifest lists them.
-pub const default_scopes = types.ScopeSet.init(.{
+const default_scopes = types.ScopeSet.init(.{
     .interactive = true,
     .ask = true,
     .acp = true,
 });
 
-pub const ParseError = error{ OutOfMemory, InvalidManifest };
+const ParseError = error{ OutOfMemory, InvalidManifest };
 
 /// Parses `bytes`. Strings in the result are allocated in `arena`; `gpa`
 /// backs the short-lived Lua state.

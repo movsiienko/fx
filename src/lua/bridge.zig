@@ -8,7 +8,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 
-pub const max_depth = 64;
+const max_depth = 64;
 
 /// The address behind `agent.json.null`.
 var json_null_marker: u8 = 0;
@@ -81,7 +81,7 @@ fn pushNumberString(L: ?*c.State, digits: []const u8) void {
     }
 }
 
-pub const EncodeError = error{
+const EncodeError = error{
     OutOfMemory,
     ResultTooLarge,
     NestedTooDeeply,

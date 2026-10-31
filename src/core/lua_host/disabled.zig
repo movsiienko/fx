@@ -5,7 +5,7 @@ const std = @import("std");
 const hooks = @import("../hooks/hooks.zig");
 const listing = @import("listing.zig");
 
-pub const RegisterOptions = struct {
+const RegisterOptions = struct {
     home: ?[]const u8 = null,
 };
 
@@ -16,12 +16,12 @@ pub const Summary = struct {
     unreadable_folder: ?UnreadableFolder = null,
 };
 
-pub const LoadFailure = struct {
+const LoadFailure = struct {
     name: []const u8,
     message: []const u8,
 };
 
-pub const UnreadableFolder = struct {
+const UnreadableFolder = struct {
     path: []const u8,
     reason: []const u8,
 };

@@ -24,7 +24,7 @@ pub const Scope = enum {
 pub const ScopeSet = std.EnumSet(Scope);
 
 pub const Limits = struct {
-    pub const default_memory_bytes: usize = 4 * 1024 * 1024;
+    const default_memory_bytes: usize = 4 * 1024 * 1024;
     pub const max_memory_mb: usize = 64;
     pub const default_instructions_per_call: u32 = 5_000_000;
     pub const min_instructions_per_call: u32 = 1_000;
@@ -77,7 +77,7 @@ pub const Diagnostic = struct {
 /// Count hook for the instruction budget. Once the budget is spent it fires
 /// on every instruction, so a `pcall` in the extension cannot catch the
 /// error and keep running.
-pub fn onInstructionBudget(L: ?*c.State, _: ?*c.Debug) callconv(.c) void {
+fn onInstructionBudget(L: ?*c.State, _: ?*c.Debug) callconv(.c) void {
     c.lua_sethook(L, onInstructionBudget, c.LUA_MASKCOUNT, 1);
     c.raise(L, "instruction budget exceeded");
 }
