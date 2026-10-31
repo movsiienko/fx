@@ -598,6 +598,7 @@ fn writeNewSessionResponse(
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
     try sendAvailableCommands(state, alloc, session_id, "[]");
+    try sendLuaNotice(state, alloc, session_id);
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -1138,6 +1139,7 @@ fn writeLoadSessionResponse(
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    try sendLuaNotice(state, alloc, state.active_session.?.session_id);
 }
 
 fn freshAcpState(
@@ -1928,6 +1930,26 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
         acp_types.generateMessageId(&message_id),
         text,
     );
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+/// Tells the client which Lua extensions won't run: an ACP v1 Session
+/// Notice where the client shows them, otherwise agent text, as fx's other
+/// notices are.
+fn sendLuaNotice(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    const notice = state.lua_notice orelse return;
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    if (state.client_notices) {
+        try acp_types.writeNotice(&out.writer, "info", notice);
+    } else {
+        try acp_types.writeAgentMessageChunk(&out.writer, acp_types.generateMessageId(&message_id), notice);
+    }
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }

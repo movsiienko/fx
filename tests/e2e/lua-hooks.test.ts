@@ -147,6 +147,29 @@ async function askToRead(root: Root, path: string) {
   }
 }
 
+// Starts `fx acp`, opens a session, and returns every message the client
+// received. The server reads to end of input, so all of them arrive first.
+async function acpSessionStart(root: Root, clientCapabilities: object = {}) {
+  const gateway = startFakeGateway([]);
+  try {
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities } },
+      { jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: root.workspace, mcpServers: [] } },
+    ];
+    const result = await runFx(["acp"], {
+      cwd: root.workspace,
+      env: env(root, gateway),
+      stdin: requests.map((request) => `${JSON.stringify(request)}\n`).join(""),
+      timeoutMs: TIMEOUT,
+    });
+    const messages = result.stdout.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line));
+    expect(messages.find((message) => message.id === 2)?.result?.sessionId).toBeString();
+    return { result, messages };
+  } finally {
+    gateway.stop();
+  }
+}
+
 describe("Lua extension hooks", () => {
   test(
     "a new extension waits for review and runs once trusted",
@@ -276,5 +299,45 @@ describe("Lua extension hooks", () => {
       }
     },
     TIMEOUT * 2,
+  );
+
+  test(
+    "an ACP client is told about an extension waiting for review",
+    async () => {
+      const root = createRoot();
+      try {
+        const untrusted = await acpSessionStart(root);
+        const updates = untrusted.messages.filter((message) => message.method === "session/update");
+        expect(JSON.stringify(updates)).toContain("Lua extension policy is new or changed");
+        expect(JSON.stringify(updates)).toContain("fx extensions list");
+
+        expect((await extensions(root, ["trust", "policy"])).code).toBe(0);
+        const trusted = await acpSessionStart(root);
+        expect(trusted.result.stdout).not.toContain("Lua extension");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
+    "an ACP client that shows session notices gets the review notice as one",
+    async () => {
+      const root = createRoot();
+      try {
+        const started = await acpSessionStart(root, { session: { notices: {} } });
+        const updates = started.messages.map((message) => message.params?.update).filter(Boolean);
+        const notices = updates.filter((update) => update.sessionUpdate === "notice");
+        expect(notices).toHaveLength(1);
+        expect(notices[0].title).toBe(
+          "Lua extension policy is new or changed and won't run until you review it. Run fx extensions list to see it.",
+        );
+        expect(JSON.stringify(updates.filter((update) => update.sessionUpdate !== "notice"))).not.toContain("Lua extension");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 });
