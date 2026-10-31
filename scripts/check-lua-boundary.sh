@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The Lua engine in src/lua sits behind one front door, engine.zig. Code
-# outside imports only that file. The engine imports only the standard
+# outside imports only that file; the fuzz root also imports manifest.zig,
+# because it holds the lua_manifest fuzz target. The engine imports only the standard
 # library, its own files, and the translated Lua header (lua_c), so it holds
 # no fx state and reads no files: the host hands it every file an extension
 # may load. Only src/core/lua_host adapts it to fx's hook runtime.
@@ -15,7 +16,7 @@ folder="src/lua"
 
 reaching_in="$({
   git grep --untracked -n -E '@import\("[^"]*lua/[a-z_]+\.zig"\)' -- src ":(exclude)$folder" || true
-} | grep -v 'lua/engine\.zig")' || true)"
+} | grep -v -E 'lua/engine\.zig"\)|^src/fuzz_targets\.zig:[0-9]+: +_ = @import\("lua/manifest\.zig"\);$' || true)"
 if [[ -n "$reaching_in" ]]; then
   printf 'Only %s/engine.zig may be imported from outside the engine:\n%s\n' "$folder" "$reaching_in" >&2
   exit 1

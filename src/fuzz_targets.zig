@@ -37,6 +37,7 @@ test {
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
     _ = @import("lua/engine.zig");
+    _ = @import("lua/manifest.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/url_policy.zig");
