@@ -1409,7 +1409,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 38", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 39", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
