@@ -406,8 +406,10 @@ fn addLua(
             "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c", "ltablib.c",
             "lutf8lib.c",
         },
+        // A Debug build asserts on C API misuse, such as pushing past the
+        // stack space a C function was given, so tests catch it.
         .flags = if (optimize == .debug)
-            &.{"-std=gnu99"}
+            &.{ "-std=gnu99", "-DLUA_USE_APICHECK" }
         else
             &.{ "-std=gnu99", "-Os" },
     });

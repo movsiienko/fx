@@ -419,15 +419,21 @@ fn agentLog(L: ?*c.State) callconv(.c) c_int {
 
 fn luaPrint(L: ?*c.State) callconv(.c) c_int {
     const ext = extFrom(L);
+    // Like the stock `print`, convert one argument at a time and pop it, so
+    // any number of arguments fits in the stack space a C function gets.
+    // One byte past the log limit lets `writeLog` cut at a UTF-8 boundary.
+    var buffer: [max_log_bytes + 1]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&buffer);
     const count = c.lua_gettop(L);
     var i: c_int = 1;
     while (i <= count) : (i += 1) {
-        if (i > 1) c.pushString(L, "\t");
-        _ = c.luaL_tolstring(L, i, null);
+        var len: usize = 0;
+        const text = c.luaL_tolstring(L, i, &len);
+        if (i > 1) line.writeAll("\t") catch {};
+        line.writeAll(text[0..len]) catch {};
+        c.pop(L, 1);
     }
-    if (count == 0) c.pushString(L, "");
-    c.lua_concat(L, @max(count * 2 - 1, 1));
-    writeLog(ext, .info, c.stringAt(L, -1).?);
+    writeLog(ext, .info, line.buffered());
     return 0;
 }
 
@@ -731,6 +737,30 @@ test "agent.kv reads state.json and print goes to the log" {
         \\{"continue":"force2nil"}
     );
     try std.testing.expectEqualStrings("test info loaded\t1\ttrue\ntest warn checking\n", log.lines.items);
+}
+
+test "print with hundreds of values logs one line and the hook returns" {
+    var log: TestLog = .{};
+    defer log.lines.deinit(std.testing.allocator);
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local t = {}
+        \\  for i = 1, 200 do t[i] = i % 10 end
+        \\  print(table.unpack(t))
+        \\  return { ok = true }
+        \\end)
+    , &.{}, .{ .log = log.sink() });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"ok":true}
+    );
+    const expected = comptime blk: {
+        const run = "1\t2\t3\t4\t5\t6\t7\t8\t9\t0";
+        var line: []const u8 = "test info " ++ run;
+        for (1..20) |_| line = line ++ "\t" ++ run;
+        break :blk line ++ "\n";
+    };
+    try std.testing.expectEqualStrings(expected, log.lines.items);
 }
 
 test "invalid return values and inputs are reported" {
