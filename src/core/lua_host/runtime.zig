@@ -7,6 +7,7 @@ const hooks = @import("../hooks/hooks.zig");
 const settings_store = @import("../config/settings_store.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const adapter = @import("adapter.zig");
 const catalog_mod = @import("catalog.zig");
 const listing = @import("listing.zig");
@@ -50,7 +51,16 @@ pub const Hooks = struct {
         const home = options.home orelse io_mod.homeDir() orelse return .{};
         var catalog = catalog_mod.Catalog.load(gpa, home) catch |err| {
             debug_trace.logf("lua_hooks", "event=discovery_failed error={s}", .{@errorName(err)});
-            return .{};
+            // Nothing runs, so say so: a policy extension that silently stops
+            // enforcing is worse than a notice.
+            self.arena = .init(gpa);
+            const a = self.arena.?.allocator();
+            const failures = try a.alloc(LoadFailure, 1);
+            failures[0] = .{
+                .name = try std.Io.Dir.path.join(a, &.{ try profile_paths.rootDir(a, home), catalog_mod.extensions_dir_name }),
+                .message = try a.print("the folder cannot be read ({s}), so no extension runs", .{@errorName(err)}),
+            };
+            return .{ .load_failures = failures };
         };
         defer catalog.deinit();
         if (catalog.extensions.len == 0) return .{};
@@ -293,4 +303,26 @@ test "disable and enable switch a trusted extension without forgetting its revie
     try std.testing.expectEqual(listing.State.trusted, result.find("policy").?.state);
     result.deinit();
     try std.testing.expectError(error.UnknownExtension, execute(std.testing.allocator, .{ .trust = "absent" }, home.home));
+}
+
+test "an extensions folder that cannot be read is reported at session start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    // A link to itself fails to open for root too.
+    try tmp.dir.symLink(std.testing.io, "extensions", ".fx/extensions", .{ .is_directory = true });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home });
+    try std.testing.expectEqual(@as(usize, 0), summary.loaded);
+    try std.testing.expectEqual(@as(usize, 1), summary.load_failures.len);
+    const directory = try std.testing.allocator.print("{s}/.fx/extensions", .{home});
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqualStrings(directory, summary.load_failures[0].name);
+    try std.testing.expectEqualStrings("the folder cannot be read (SymLinkLoop), so no extension runs", summary.load_failures[0].message);
 }

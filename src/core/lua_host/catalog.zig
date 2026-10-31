@@ -8,6 +8,7 @@
 //! was hashed is exactly what runs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const engine = @import("../../lua/engine.zig");
 const settings_store = @import("../config/settings_store.zig");
 const io_mod = @import("../shared/io.zig");
@@ -222,7 +223,16 @@ const FileWalk = struct {
     fn walk(self: *FileWalk, dir: std.Io.Dir, prefix: []const u8, depth: usize) !void {
         const io = io_mod.getIo();
         var it = dir.iterate();
-        while (try it.next(io)) |entry| {
+        while (true) {
+            const next = it.next(io) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    const folder = if (prefix.len == 0) "the extension folder" else prefix;
+                    self.problem = try self.a.print("{s} cannot be listed ({s})", .{ folder, @errorName(err) });
+                    return;
+                },
+            };
+            const entry = next orelse return;
             if (self.problem != null) return;
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             const path = if (prefix.len == 0)
@@ -241,7 +251,11 @@ const FileWalk = struct {
                             self.problem = try self.a.print("{s} is larger than 1 MiB", .{path});
                             return;
                         },
-                        else => return err,
+                        error.OutOfMemory, error.Canceled => |e| return e,
+                        else => {
+                            self.problem = try self.a.print("{s} cannot be read ({s})", .{ path, @errorName(err) });
+                            return;
+                        },
                     };
                     if (bytes.len > max_file_bytes) {
                         self.problem = try self.a.print("{s} is larger than 1 MiB", .{path});
@@ -256,7 +270,13 @@ const FileWalk = struct {
                 },
                 .directory => {
                     if (depth >= max_depth) continue;
-                    var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                    var child = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                        error.Canceled => return err,
+                        else => {
+                            self.problem = try self.a.print("the folder {s} cannot be opened ({s})", .{ path, @errorName(err) });
+                            return;
+                        },
+                    };
                     defer child.close(io);
                     try self.walk(child, path, depth + 1);
                 },
@@ -493,6 +513,45 @@ const TestHome = struct {
 
 const policy_manifest = "return { name = \"policy\", events = { \"pre_tool_use\" } }";
 
+/// Leaves the process exactly `spare` free file descriptors, so the open
+/// after them fails with error.ProcessFdQuotaExceeded. Unlike file modes,
+/// root obeys this too.
+const OpenFileLimit = struct {
+    const max_held = 64;
+
+    saved: std.posix.rlimit,
+    held: [max_held]std.Io.Dir = undefined,
+    held_len: usize = 0,
+
+    fn init(tmp_dir: std.Io.Dir, spare: usize) !OpenFileLimit {
+        const io = std.testing.io;
+        var limit: OpenFileLimit = .{ .saved = try std.posix.getrlimit(.NOFILE) };
+        const probe = try tmp_dir.openDir(io, ".", .{});
+        const lowest_free: u64 = @intCast(probe.handle);
+        probe.close(io);
+        try std.posix.setrlimit(.NOFILE, .{ .cur = lowest_free + max_held, .max = limit.saved.max });
+        errdefer limit.restore();
+        // Descriptors in use above the lowest free one leave gaps, so fill
+        // every free one below the limit, then free `spare` of them.
+        while (tmp_dir.openDir(io, ".", .{})) |dir| {
+            limit.held[limit.held_len] = dir;
+            limit.held_len += 1;
+        } else |err| if (err != error.ProcessFdQuotaExceeded) return err;
+        if (limit.held_len < spare) return error.TestUnexpectedResult;
+        for (0..spare) |_| {
+            limit.held_len -= 1;
+            limit.held[limit.held_len].close(io);
+        }
+        return limit;
+    }
+
+    fn restore(self: *OpenFileLimit) void {
+        for (self.held[0..self.held_len]) |dir| dir.close(std.testing.io);
+        self.held_len = 0;
+        std.posix.setrlimit(.NOFILE, self.saved) catch {};
+    }
+};
+
 test "a new extension needs review and a trusted one runs until it changes" {
     var home = try TestHome.init();
     defer home.deinit();
@@ -582,4 +641,52 @@ test "failure records count only for the contents they were written for" {
     defer catalog.deinit();
     entry = catalog.find("policy").?;
     try std.testing.expectEqual(listing.State.trusted, entry.state);
+}
+
+test "a folder that cannot be opened makes only its extension invalid" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var home = try TestHome.init();
+    defer home.deinit();
+    try home.write("policy/manifest.lua", policy_manifest);
+    try home.write("policy/main.lua", "");
+    try home.write("broken/manifest.lua", "return { name = \"broken\", events = { \"stop\" } }");
+    try home.write("broken/main.lua", "");
+    try home.write("broken/a/b/c/deep.lua", "");
+
+    // Four spare descriptors hold the extensions folder, the extension
+    // folder, a, and b, so opening broken/a/b/c fails.
+    var limit = try OpenFileLimit.init(home.tmp.dir, 4);
+    var catalog = Catalog.load(std.testing.allocator, home.home);
+    limit.restore();
+    defer if (catalog) |*loaded| loaded.deinit() else |_| {};
+
+    const extensions = &(try catalog);
+    try std.testing.expectEqual(listing.State.needs_review, extensions.find("policy").?.state);
+    const broken = extensions.find("broken").?;
+    try std.testing.expectEqual(listing.State.invalid, broken.state);
+    try std.testing.expectEqualStrings("the folder a/b/c cannot be opened (ProcessFdQuotaExceeded)", broken.problem.?);
+}
+
+test "a file that cannot be read makes only its extension invalid" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var home = try TestHome.init();
+    defer home.deinit();
+    try home.write("policy/manifest.lua", policy_manifest);
+    try home.write("policy/main.lua", "");
+    try home.write("broken/manifest.lua", "return { name = \"broken\", events = { \"stop\" } }");
+    try home.write("broken/main.lua", "");
+    try home.write("broken/a/deep.lua", "");
+
+    // Three spare descriptors hold the extensions folder, the extension
+    // folder, and a, so reading broken/a/deep.lua fails.
+    var limit = try OpenFileLimit.init(home.tmp.dir, 3);
+    var catalog = Catalog.load(std.testing.allocator, home.home);
+    limit.restore();
+    defer if (catalog) |*loaded| loaded.deinit() else |_| {};
+
+    const extensions = &(try catalog);
+    try std.testing.expectEqual(listing.State.needs_review, extensions.find("policy").?.state);
+    const broken = extensions.find("broken").?;
+    try std.testing.expectEqual(listing.State.invalid, broken.state);
+    try std.testing.expectEqualStrings("a/deep.lua cannot be read (ProcessFdQuotaExceeded)", broken.problem.?);
 }
