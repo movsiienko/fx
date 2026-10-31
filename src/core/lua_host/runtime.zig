@@ -326,3 +326,42 @@ test "an extensions folder that cannot be read is reported at session start" {
     try std.testing.expectEqualStrings(directory, summary.load_failures[0].name);
     try std.testing.expectEqualStrings("the folder cannot be read (SymLinkLoop), so no extension runs", summary.load_failures[0].message);
 }
+
+test "failures from concurrent hook calls are all counted and outlive the session" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = "policy" }, home.home);
+    trusted.deinit();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    _ = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    const view = runtime.freeze();
+
+    const Caller = struct {
+        fn run(caller_view: hooks.RuntimeView, unblocked: *std.atomic.Value(usize)) void {
+            for (0..25) |_| {
+                var outcome = testPreToolUse(caller_view, .ask, "explode", "{}") catch {
+                    _ = unblocked.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                defer outcome.deinit(std.testing.allocator);
+                if (outcome != .blocked) _ = unblocked.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var unblocked: std.atomic.Value(usize) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Caller.run, .{ view, &unblocked });
+    for (threads) |thread| thread.join();
+    lua_hooks.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unblocked.load(.monotonic));
+
+    var after = try execute(std.testing.allocator, .list, home.home);
+    defer after.deinit();
+    const entry = after.find("policy").?;
+    try std.testing.expectEqual(listing.State.failing, entry.state);
+    try std.testing.expectEqual(@as(u64, 200), entry.failures);
+    try std.testing.expectEqualStrings("policy/main.lua:8: kaboom", entry.last_error.?);
+}

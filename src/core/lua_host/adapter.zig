@@ -27,10 +27,46 @@ pub const Loaded = struct {
     scopes: engine.ScopeSet,
     lua: *engine.Extension,
     hooks: std.EnumArray(engine.Event, LuaHook),
+    failures: FailureLog = .{},
 
+    /// Writes the failures not yet recorded and frees the Lua state.
     pub fn deinit(self: *Loaded) void {
+        const io = io_mod.getIo();
+        self.failures.mutex.lockUncancelable(io);
+        if (self.failures.pending > 0) self.writeFailures(io_mod.milliTimestamp());
+        self.failures.mutex.unlock(io);
         for (&self.hooks.values) |*hook| hook.results.deinit(self.gpa);
         self.lua.deinit();
+    }
+
+    /// Counts one failed call. The first failure is recorded at once, so a
+    /// crash still leaves a record; later ones at most once per interval
+    /// and when the session ends, so a hook that fails on every tool call
+    /// does not read and sync a file each time.
+    fn recordFailure(self: *Loaded, message: []const u8) void {
+        const io = io_mod.getIo();
+        self.failures.mutex.lockUncancelable(io);
+        defer self.failures.mutex.unlock(io);
+        const log = &self.failures;
+        log.pending += 1;
+        const kept = truncateUtf8(message, log.last_error.len);
+        @memcpy(log.last_error[0..kept.len], kept);
+        log.last_error_len = kept.len;
+        const now = io_mod.milliTimestamp();
+        if (log.last_write_ms) |last| {
+            if (now - last < FailureLog.write_interval_ms) return;
+        }
+        self.writeFailures(now);
+    }
+
+    /// Adds the pending failures to the record. The caller holds the failure
+    /// lock, so writes never overlap. A failed write keeps them for the next.
+    fn writeFailures(self: *Loaded, now: i64) void {
+        const log = &self.failures;
+        log.last_write_ms = now;
+        const last_error = log.last_error[0..log.last_error_len];
+        catalog.recordFailures(self.gpa, self.home, self.name, self.sha256, log.pending, last_error) catch return;
+        log.pending = 0;
     }
 
     pub fn register(self: *Loaded, runtime: *hooks.Runtime) !void {
@@ -49,6 +85,18 @@ pub const Loaded = struct {
             }
         }
     }
+};
+
+/// Failed calls not yet written to the extension's failure record. Hooks
+/// fail on several threads at once, so they are counted under a lock.
+const FailureLog = struct {
+    const write_interval_ms = 1000;
+
+    mutex: std.Io.Mutex = .init,
+    pending: u64 = 0,
+    last_error: [engine.Diagnostic.max_bytes]u8 = undefined,
+    last_error_len: usize = 0,
+    last_write_ms: ?i64 = null,
 };
 
 pub const LuaHook = struct {
@@ -95,7 +143,7 @@ pub const LuaHook = struct {
 
     fn failed(self: *LuaHook, arena: Allocator, message: []const u8) CallOutcome {
         debug_trace.logf("lua_hooks", "event=hook_failed handler={s} error={s}", .{ self.name(), message });
-        catalog.recordFailure(self.loaded.gpa, self.loaded.home, self.loaded.name, self.loaded.sha256, message);
+        self.loaded.recordFailure(message);
         return .{ .failure = arena.dupe(u8, message) catch "not enough memory" };
     }
 

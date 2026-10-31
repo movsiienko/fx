@@ -448,10 +448,14 @@ fn readFailures(a: Allocator, fx_root: []const u8, extension: *Extension) !void 
 /// Counts one failed call. Best effort: a hook failure must never fail
 /// because its record could not be written.
 pub fn recordFailure(gpa: Allocator, home: []const u8, name: []const u8, sha256: []const u8, message: []const u8) void {
-    recordFailureOrError(gpa, home, name, sha256, message) catch {};
+    recordFailures(gpa, home, name, sha256, 1, message) catch {};
 }
 
-fn recordFailureOrError(gpa: Allocator, home: []const u8, name: []const u8, sha256: []const u8, message: []const u8) !void {
+/// Adds `count` failed calls to the record, whose last error is `message`.
+/// The count is added to what the record holds now, so failures another
+/// process counted stay counted and failures `fx extensions trust` cleared
+/// stay cleared.
+pub fn recordFailures(gpa: Allocator, home: []const u8, name: []const u8, sha256: []const u8, count: u64, message: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -465,7 +469,7 @@ fn recordFailureOrError(gpa: Allocator, home: []const u8, name: []const u8, sha2
     var out: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(.{
         .sha256 = sha256,
-        .failures = previous.failures + 1,
+        .failures = previous.failures + count,
         .last_error = message,
         .last_failure_ms = io_mod.milliTimestamp(),
     }, .{}, &out.writer);
