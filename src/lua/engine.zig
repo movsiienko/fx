@@ -689,6 +689,99 @@ test "a backtracking pattern is cut off inside its C call" {
     try expectCallFails(ext, .stop, "{}", error.HookFailed, "pattern too complex");
 }
 
+test "string.rep of an empty result returns at once" {
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local a = string.rep("", math.maxinteger)
+        \\  local b = string.rep("", math.maxinteger, "")
+        \\  return { continue = "[" .. a .. "][" .. b .. "][" .. string.rep("ab", 3, ",") .. "]" }
+        \\end)
+    , &.{}, .{});
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"[][][ab,ab,ab]"}
+    );
+}
+
+test "table.move over a huge range fails instead of hanging" {
+    const ext = try loadForTest(
+        \\agent.on("stop", function() table.move({}, 1, math.maxinteger - 1, 2) end)
+        \\agent.on("post_turn_end", function()
+        \\  return { continue = table.concat(table.move({ "a", "b", "c" }, 1, 3, 2), ",") }
+        \\end)
+    , &.{}, .{});
+    defer ext.deinit();
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to move");
+    try expectCall(ext, .post_turn_end, "{}",
+        \\{"continue":"a,a,b,c"}
+    );
+}
+
+test "table.concat over a huge range of a proxy fails instead of hanging" {
+    // A C function as __index answers every index with "" without running
+    // a Lua instruction or growing the result.
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local proxy = setmetatable({}, { __index = table.concat })
+        \\  return { continue = table.concat(proxy, "", 1, math.maxinteger) }
+        \\end)
+        \\agent.on("post_turn_end", function()
+        \\  local proxy = setmetatable({}, { __index = table.concat })
+        \\  return { continue = "[" .. table.concat(proxy, "", 1, 3) .. "]" }
+        \\end)
+    , &.{}, .{});
+    defer ext.deinit();
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to concatenate");
+    try expectCall(ext, .post_turn_end, "{}",
+        \\{"continue":"[]"}
+    );
+}
+
+test "table.insert and table.remove under a huge __len fail instead of hanging" {
+    const ext = try loadForTest(
+        \\local function huge() return setmetatable({}, { __len = function() return math.maxinteger - 1 end }) end
+        \\agent.on("stop", function() table.insert(huge(), 1, "x") end)
+        \\agent.on("pre_tool_use", function() table.remove(huge(), 1) end)
+        \\agent.on("post_turn_end", function()
+        \\  local t = { "a", "c" }
+        \\  table.insert(t, 2, "b")
+        \\  local removed = table.remove(t, 1)
+        \\  return { continue = removed .. ":" .. table.concat(t, ",") }
+        \\end)
+    , &.{}, .{});
+    defer ext.deinit();
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to move");
+    try expectCallFails(ext, .pre_tool_use, "{}", error.HookFailed, "too many elements to move");
+    try expectCall(ext, .post_turn_end, "{}",
+        \\{"continue":"a:b,c"}
+    );
+}
+
+test "table.sort under a huge __len fails instead of running for hours" {
+    // C functions as __index and __newindex read 0 and store nothing, so
+    // the sort neither runs Lua instructions nor allocates.
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local proxy = setmetatable({}, {
+        \\    __len = function() return 2147483646 end,
+        \\    __index = rawlen,
+        \\    __newindex = rawequal,
+        \\  })
+        \\  table.sort(proxy)
+        \\end)
+        \\agent.on("post_turn_end", function()
+        \\  local t = { 3, 1, 2 }
+        \\  table.sort(t)
+        \\  return { continue = table.concat(t, ",") }
+        \\end)
+    , &.{}, .{});
+    defer ext.deinit();
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "array too big");
+    try expectCall(ext, .post_turn_end, "{}",
+        \\{"continue":"1,2,3"}
+    );
+}
+
 test "agent.on is valid only while loading and only for manifest events" {
     var diagnostic: Diagnostic = .{};
     const files = [_]SourceFile{.{ .path = "main.lua", .bytes = "agent.on(\"stop\", function() end)" }};

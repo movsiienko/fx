@@ -152,7 +152,7 @@ static int str_rep (lua_State *L) {
   const char *s = luaL_checklstring(L, 1, &l);
   lua_Integer n = luaL_checkinteger(L, 2);
   const char *sep = luaL_optlstring(L, 3, "", &lsep);
-  if (n <= 0)
+  if (n <= 0 || l + lsep == 0)  /* fx: an empty result needs no loop */
     lua_pushliteral(L, "");
   else if (l_unlikely(l + lsep < l || l + lsep > MAXSIZE / n))
     return luaL_error(L, "resulting string too large");

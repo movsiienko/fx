@@ -33,6 +33,19 @@
 #define aux_getn(L,n,w)	(checktab(L, n, (w) | TAB_L), luaL_len(L, n))
 
 
+/*
+** fx: the most elements one call of 'insert', 'remove', 'move', 'concat'
+** or 'sort' works over. These loop inside one C call, where the
+** instruction budget cannot stop them, and the count comes from an
+** argument or a '__len' metamethod, not from what the table holds. 2^22
+** slots of 16 bytes fill fx's largest memory limit (64 MiB), so no table
+** an extension can build holds more elements.
+*/
+#if !defined(MAXTABELEMS)
+#define MAXTABELEMS	((lua_Integer)1 << 22)
+#endif
+
+
 static int checkfield (lua_State *L, const char *key, int n) {
   lua_pushstring(L, key);
   return (lua_rawget(L, -n) != LUA_TNIL);
@@ -73,6 +86,8 @@ static int tinsert (lua_State *L) {
       /* check whether 'pos' is in [1, e] */
       luaL_argcheck(L, (lua_Unsigned)pos - 1u < (lua_Unsigned)e, 2,
                        "position out of bounds");
+      luaL_argcheck(L, pos >= e || e - pos <= MAXTABELEMS, 2,  /* fx */
+                       "too many elements to move");
       for (i = e; i > pos; i--) {  /* move up elements */
         lua_geti(L, 1, i - 1);
         lua_seti(L, 1, i);  /* t[i] = t[i - 1] */
@@ -95,6 +110,8 @@ static int tremove (lua_State *L) {
     /* check whether 'pos' is in [1, size + 1] */
     luaL_argcheck(L, (lua_Unsigned)pos - 1u <= (lua_Unsigned)size, 2,
                      "position out of bounds");
+  luaL_argcheck(L, pos >= size || size - pos <= MAXTABELEMS, 2,  /* fx */
+                   "too many elements to move");
   lua_geti(L, 1, pos);  /* result = t[pos] */
   for ( ; pos < size; pos++) {
     lua_geti(L, 1, pos + 1);
@@ -124,6 +141,8 @@ static int tmove (lua_State *L) {
     luaL_argcheck(L, f > 0 || e < LUA_MAXINTEGER + f, 3,
                   "too many elements to move");
     n = e - f + 1;  /* number of elements to move */
+    luaL_argcheck(L, n <= MAXTABELEMS, 3,  /* fx */
+                  "too many elements to move");
     luaL_argcheck(L, t <= LUA_MAXINTEGER - n + 1, 4,
                   "destination wrap around");
     if (t > e || t <= f || (tt != 1 && !lua_compare(L, 1, tt, LUA_OPEQ))) {
@@ -160,6 +179,9 @@ static int tconcat (lua_State *L) {
   const char *sep = luaL_optlstring(L, 2, "", &lsep);
   lua_Integer i = luaL_optinteger(L, 3, 1);
   last = luaL_optinteger(L, 4, last);
+  luaL_argcheck(L, i > last ||  /* fx */
+                   (lua_Unsigned)last - (lua_Unsigned)i < (lua_Unsigned)MAXTABELEMS,
+                   4, "too many elements to concatenate");
   luaL_buffinit(L, &b);
   for (; i < last; i++) {
     addfield(L, &b, i);
@@ -400,6 +422,7 @@ static int sort (lua_State *L) {
   lua_Integer n = aux_getn(L, 1, TAB_RW);
   if (n > 1) {  /* non-trivial interval? */
     luaL_argcheck(L, n < INT_MAX, 1, "array too big");
+    luaL_argcheck(L, n <= MAXTABELEMS, 1, "array too big");  /* fx */
     if (!lua_isnoneornil(L, 2))  /* is there a 2nd argument? */
       luaL_checktype(L, 2, LUA_TFUNCTION);  /* must be a function */
     lua_settop(L, 2);  /* make sure there are two arguments */
