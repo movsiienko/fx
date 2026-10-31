@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const text_utils = @import("../shared/text_utils.zig");
 const listing = @import("listing.zig");
 
 pub const enabled = build_options.lua_hooks;
@@ -44,6 +45,8 @@ pub fn AppRuntime(comptime App: type) type {
 
 /// The session-start notice for `summary`, or null when there is nothing
 /// to say. `review_command` is how the user lists extensions from here.
+/// Folder names and Lua error text reach the terminal as visible escapes,
+/// since anything that can write to `~/.fx/extensions/` chooses them.
 /// The caller owns the result.
 pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []const u8) !?[]u8 {
     if (summary.needs_review.len == 0 and summary.load_failures.len == 0) return null;
@@ -51,23 +54,31 @@ pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []
     errdefer out.deinit();
     const w = &out.writer;
     if (summary.needs_review.len == 1) {
-        try w.print("Lua extension {s} is new or changed and won't run until you review it. Run {s} to see it.", .{
-            summary.needs_review[0],
-            review_command,
-        });
+        try w.writeAll("Lua extension ");
+        try writeTerminalSafe(w, alloc, summary.needs_review[0]);
+        try w.print(" is new or changed and won't run until you review it. Run {s} to see it.", .{review_command});
     } else if (summary.needs_review.len > 1) {
         try w.print("{d} Lua extensions are new or changed and won't run until you review them: ", .{summary.needs_review.len});
         for (summary.needs_review, 0..) |name, i| {
             if (i > 0) try w.writeAll(", ");
-            try w.writeAll(name);
+            try writeTerminalSafe(w, alloc, name);
         }
         try w.print(". Run {s} to see them.", .{review_command});
     }
     for (summary.load_failures) |failure| {
         if (out.written().len > 0) try w.writeByte('\n');
-        try w.print("Lua extension {s} failed to load: {s}", .{ failure.name, failure.message });
+        try w.writeAll("Lua extension ");
+        try writeTerminalSafe(w, alloc, failure.name);
+        try w.writeAll(" failed to load: ");
+        try writeTerminalSafe(w, alloc, failure.message);
     }
     return try out.toOwnedSlice();
+}
+
+fn writeTerminalSafe(w: *std.Io.Writer, alloc: std.mem.Allocator, raw: []const u8) !void {
+    const encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+    defer alloc.free(encoded.bytes);
+    try w.writeAll(encoded.bytes);
 }
 
 test "the session-start notice names extensions waiting for review" {
@@ -84,6 +95,34 @@ test "the session-start notice names extensions waiting for review" {
     try std.testing.expectEqualStrings(
         "2 Lua extensions are new or changed and won't run until you review them: a, b. Run fx extensions list to see them.\n" ++
             "Lua extension c failed to load: main.lua:1: boom",
+        two,
+    );
+}
+
+test "the session-start notice escapes control bytes in names and Lua errors" {
+    const alloc = std.testing.allocator;
+    for ([_]Summary{
+        .{ .needs_review = &.{"x\x1b]52;c;aGk=\x07"} },
+        .{
+            .needs_review = &.{ "a\x1b[2K", "b" },
+            .load_failures = &.{.{ .name = "c\x07", .message = "main.lua:1: \x1b]0;pwned\x07\r\nboom" }},
+        },
+    }) |summary| {
+        const notice = (try noticeText(alloc, summary, "fx extensions list")).?;
+        defer alloc.free(notice);
+        for (notice) |byte| {
+            if (byte == '\n') continue;
+            try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+        }
+    }
+    const two = (try noticeText(alloc, .{
+        .needs_review = &.{ "a\x1b[2K", "b" },
+        .load_failures = &.{.{ .name = "c\x07", .message = "main.lua:1: \x1b]0;pwned\x07\r\nboom" }},
+    }, "fx extensions list")).?;
+    defer alloc.free(two);
+    try std.testing.expectEqualStrings(
+        "2 Lua extensions are new or changed and won't run until you review them: a\\x1b[2K, b. Run fx extensions list to see them.\n" ++
+            "Lua extension c\\x07 failed to load: main.lua:1: \\x1b]0;pwned\\x07\\x0d\\x0aboom",
         two,
     );
 }

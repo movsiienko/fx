@@ -464,7 +464,9 @@ pub const ExtensionsSnapshot = struct {
                 .enable => "enabled",
                 .list => unreachable,
             };
-            try w.print("{s}{s} {s}; this takes effect the next time fx starts\n", .{ prefix, done, name });
+            try w.print("{s}{s} ", .{ prefix, done });
+            try writeTerminalSafe(w, alloc, name);
+            try w.writeAll("; this takes effect the next time fx starts\n");
         }
         if (listing.entries.len == 0) {
             try w.print("{s}extensions: (none)\n", .{prefix});
@@ -472,7 +474,8 @@ pub const ExtensionsSnapshot = struct {
         }
         try w.print("{s}extensions:\n", .{prefix});
         for (listing.entries) |entry| {
-            try w.print(" - {s}", .{entry.name});
+            try w.writeAll(" - ");
+            try writeTerminalSafe(w, alloc, entry.name);
             if (entry.version.len > 0) {
                 try w.writeByte(' ');
                 try writeTerminalSafe(w, alloc, entry.version);
@@ -513,13 +516,20 @@ pub const ExtensionsSnapshot = struct {
                 try w.writeByte('\n');
             }
             switch (entry.state) {
-                .needs_review => try w.print("   review its files in {s}/{s}, then run: {s} trust {s}\n", .{
-                    listing.directory,
-                    entry.name,
-                    command,
-                    entry.name,
-                }),
-                .failing => try w.print("   to turn it off, run: {s} disable {s}\n", .{ command, entry.name }),
+                .needs_review => {
+                    try w.writeAll("   review its files in ");
+                    try writeTerminalSafe(w, alloc, listing.directory);
+                    try w.writeByte('/');
+                    try writeTerminalSafe(w, alloc, entry.name);
+                    try w.print(", then run: {s} trust ", .{command});
+                    try writeTerminalSafe(w, alloc, entry.name);
+                    try w.writeByte('\n');
+                },
+                .failing => {
+                    try w.print("   to turn it off, run: {s} disable ", .{command});
+                    try writeTerminalSafe(w, alloc, entry.name);
+                    try w.writeByte('\n');
+                },
                 else => {},
             }
         }
@@ -636,6 +646,42 @@ test "extensions snapshot renders text and JSON from one listing" {
     try std.testing.expectEqualStrings("trusted", first.get("state").?.string);
     try std.testing.expect(first.get("runs").?.bool);
     try std.testing.expectEqual(@as(i64, 5000000), first.get("instructions_per_call").?.integer);
+}
+
+test "extensions snapshot text escapes control bytes in folder names" {
+    const alloc = std.testing.allocator;
+    // Folder names are whatever a process created in ~/.fx/extensions.
+    const clipboard = "x\x1b]52;c;aGk=\x07";
+    const spoof = "y\r\n - policy state=trusted\x1b[2K";
+    var listing: lua_host.Listing = .{
+        .arena = .init(alloc),
+        .directory = "/Users/example/.fx/ext\x1b[8m",
+        .action = .{ .disable = clipboard },
+        .entries = &.{
+            .{ .name = clipboard, .state = .needs_review, .events = &.{"stop"}, .scopes = &.{"ask"} },
+            .{ .name = spoof, .state = .invalid, .problem = "manifest.lua is missing" },
+            .{ .name = "z\xc2\x9b31m", .state = .failing, .events = &.{"stop"}, .scopes = &.{"ask"}, .failures = 3 },
+        },
+    };
+    defer listing.deinit();
+    const snapshot: ExtensionsSnapshot = .{ .listing = &listing };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    const body = try snapshot.renderInteractiveBody(alloc);
+    defer alloc.free(body);
+    for ([_][]const u8{ text, body }) |rendered| {
+        for (rendered) |byte| {
+            if (byte == '\n') continue;
+            try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+        }
+        try std.testing.expect(std.mem.find(u8, rendered, "\xc2\x9b") == null);
+        // The escaped name still reads as the folder it came from.
+        try std.testing.expect(std.mem.find(u8, rendered, "disabled x\\x1b]52;c;aGk=\\x07;") != null);
+        try std.testing.expect(std.mem.find(u8, rendered, " - y\\x0d\\x0a - policy state=trusted\\x1b[2K state=invalid") != null);
+        try std.testing.expect(std.mem.find(u8, rendered, "review its files in /Users/example/.fx/ext\\x1b[8m/x\\x1b]52;c;aGk=\\x07, then run:") != null);
+        try std.testing.expect(std.mem.find(u8, rendered, " disable z\\u{009b}31m") != null);
+    }
 }
 
 pub const WorkspaceSnapshot = struct {
