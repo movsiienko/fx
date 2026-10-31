@@ -25,11 +25,20 @@ pub const Summary = struct {
     loaded: usize = 0,
     needs_review: []const []const u8 = &.{},
     load_failures: []const LoadFailure = &.{},
+    /// Set when `~/.fx/extensions/` exists but cannot be read, so no
+    /// extension loaded.
+    unreadable_folder: ?UnreadableFolder = null,
 };
 
 pub const LoadFailure = struct {
     name: []const u8,
     message: []const u8,
+};
+
+pub const UnreadableFolder = struct {
+    path: []const u8,
+    /// The error name, such as `SymLinkLoop`.
+    reason: []const u8,
 };
 
 pub const Hooks = struct {
@@ -55,12 +64,10 @@ pub const Hooks = struct {
             // enforcing is worse than a notice.
             self.arena = .init(gpa);
             const a = self.arena.?.allocator();
-            const failures = try a.alloc(LoadFailure, 1);
-            failures[0] = .{
-                .name = try std.Io.Dir.path.join(a, &.{ try profile_paths.rootDir(a, home), catalog_mod.extensions_dir_name }),
-                .message = try a.print("the folder cannot be read ({s}), so no extension runs", .{@errorName(err)}),
-            };
-            return .{ .load_failures = failures };
+            return .{ .unreadable_folder = .{
+                .path = try std.Io.Dir.path.join(a, &.{ try profile_paths.rootDir(a, home), catalog_mod.extensions_dir_name }),
+                .reason = @errorName(err),
+            } };
         };
         defer catalog.deinit();
         if (catalog.extensions.len == 0) return .{};
@@ -365,11 +372,50 @@ test "an extensions folder that cannot be read is reported at session start" {
     defer lua_hooks.deinit();
     const summary = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home });
     try std.testing.expectEqual(@as(usize, 0), summary.loaded);
-    try std.testing.expectEqual(@as(usize, 1), summary.load_failures.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.load_failures.len);
     const directory = try std.testing.allocator.print("{s}/.fx/extensions", .{home});
     defer std.testing.allocator.free(directory);
-    try std.testing.expectEqualStrings(directory, summary.load_failures[0].name);
-    try std.testing.expectEqualStrings("the folder cannot be read (SymLinkLoop), so no extension runs", summary.load_failures[0].message);
+    try std.testing.expectEqualStrings(directory, summary.unreadable_folder.?.path);
+    try std.testing.expectEqualStrings("SymLinkLoop", summary.unreadable_folder.?.reason);
+}
+
+test "registration reads only the home it is given, not HOME" {
+    var given = try TestHome.init();
+    defer given.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, given.home);
+    trusted.deinit();
+
+    // HOME names another profile whose trusted extension fails to load,
+    // which would leave a failure record there.
+    var other = std.testing.tmpDir(.{});
+    defer other.cleanup();
+    try other.dir.createDirPath(std.testing.io, ".fx/extensions/broken");
+    try other.dir.writeFile(std.testing.io, .{
+        .sub_path = ".fx/extensions/broken/manifest.lua",
+        .data = "return { name = \"broken\", events = { \"stop\" } }",
+    });
+    try other.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/extensions/broken/main.lua", .data = "error(\"loaded from HOME\")" });
+    const other_home = try io_mod.dirRealpathAlloc(std.testing.allocator, other.dir, ".");
+    defer std.testing.allocator.free(other_home);
+    var other_trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "broken" } }, other_home);
+    other_trusted.deinit();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOME", other_home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = given.home });
+    try std.testing.expectEqual(@as(usize, 1), summary.loaded);
+    try std.testing.expectEqual(@as(usize, 0), summary.load_failures.len);
+    const view = runtime.freeze();
+    try std.testing.expectEqual(@as(usize, 1), view.stop_handlers.len);
+    try std.testing.expectEqualStrings("lua.policy.stop", view.stop_handlers[0].hook.name);
+    try std.testing.expectError(error.FileNotFound, other.dir.access(std.testing.io, ".fx/extension-failures", .{}));
 }
 
 test "failures from concurrent hook calls are all counted and outlive the session" {

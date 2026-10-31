@@ -49,10 +49,17 @@ pub fn AppRuntime(comptime App: type) type {
 /// since anything that can write to `~/.fx/extensions/` chooses them.
 /// The caller owns the result.
 pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []const u8) !?[]u8 {
-    if (summary.needs_review.len == 0 and summary.load_failures.len == 0) return null;
+    if (summary.needs_review.len == 0 and summary.load_failures.len == 0 and summary.unreadable_folder == null) return null;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
+    if (summary.unreadable_folder) |folder| {
+        try w.writeAll("Lua extensions in ");
+        try writeTerminalSafe(w, alloc, folder.path);
+        try w.writeAll(" cannot be read (");
+        try writeTerminalSafe(w, alloc, folder.reason);
+        try w.writeAll("), so none of them run.");
+    }
     if (summary.needs_review.len == 1) {
         try w.writeAll("Lua extension ");
         try writeTerminalSafe(w, alloc, summary.needs_review[0]);
@@ -125,6 +132,30 @@ test "the session-start notice escapes control bytes in names and Lua errors" {
             "Lua extension c\\x07 failed to load: main.lua:1: \\x1b]0;pwned\\x07\\x0d\\x0aboom",
         two,
     );
+}
+
+test "the session-start notice says when the whole extensions folder cannot be read" {
+    if (!enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    // A link to itself fails to open for root too.
+    try tmp.dir.symLink(std.testing.io, "extensions", ".fx/extensions", .{ .is_directory = true });
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var runtime = @import("../hooks/hooks.zig").Runtime.init(alloc);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(alloc, &runtime, .{ .home = home });
+    const notice = (try noticeText(alloc, summary, "/extensions")).?;
+    defer alloc.free(notice);
+    const expected = try alloc.print("Lua extensions in {s}/.fx/extensions cannot be read (SymLinkLoop), so none of them run.", .{home});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, notice);
 }
 
 test {

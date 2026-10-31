@@ -3776,6 +3776,18 @@ test "footer runtime compatibility facade exports composeFooterFrame" {
 }
 
 test "interactive app keeps notification handlers registered for live preference changes" {
+    // The app reads its profile, Lua extensions included, from HOME. An
+    // empty one keeps the test off any profile on this machine.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
     var app = App{ .alloc = std.testing.allocator };
     defer app.lifecycle_runtime.deinit();
     defer app.lua_hooks.deinit();
@@ -3784,6 +3796,10 @@ test "interactive app keeps notification handlers registered for live preference
 
     try std.testing.expect(app.lifecycle_view.hasPostTurnEnd());
     try std.testing.expect(app.lifecycle_view.hasAttentionRequired());
+    const view = app.lifecycle_view;
+    inline for (.{ view.pre_tool_use_handlers, view.stop_handlers, view.post_turn_end_handlers, view.attention_required_handlers }) |handlers| {
+        for (handlers) |handler| try std.testing.expect(!std.mem.startsWith(u8, handler.hook.name, "lua."));
+    }
 
     app.setNotificationPreferences(true, true, true);
     const preferences = app.notificationPreferences();

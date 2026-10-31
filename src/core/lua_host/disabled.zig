@@ -13,11 +13,17 @@ pub const Summary = struct {
     loaded: usize = 0,
     needs_review: []const []const u8 = &.{},
     load_failures: []const LoadFailure = &.{},
+    unreadable_folder: ?UnreadableFolder = null,
 };
 
 pub const LoadFailure = struct {
     name: []const u8,
     message: []const u8,
+};
+
+pub const UnreadableFolder = struct {
+    path: []const u8,
+    reason: []const u8,
 };
 
 pub const Hooks = struct {

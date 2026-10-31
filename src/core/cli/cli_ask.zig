@@ -6345,6 +6345,15 @@ test "fx ask bell writes only to TTY stderr" {
 }
 
 test "fx ask registers notification handlers only when configured" {
+    // `fx ask` reads its profile, Lua extensions included, from HOME. An
+    // empty one keeps the test off any profile on this machine.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const test_home = try TestAskHome.install(std.testing.allocator, home);
+    defer test_home.deinit();
+
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(std.testing.allocator);
     var stderr_capture: TestCapture = .{};
@@ -6371,6 +6380,10 @@ test "fx ask registers notification handlers only when configured" {
 
     try std.testing.expect(enabled.lifecycle_view.hasPostTurnEnd());
     try std.testing.expect(enabled.lifecycle_view.hasAttentionRequired());
+    const view = enabled.lifecycle_view;
+    inline for (.{ view.pre_tool_use_handlers, view.stop_handlers, view.post_turn_end_handlers, view.attention_required_handlers }) |handlers| {
+        for (handlers) |handler| try std.testing.expect(!std.mem.startsWith(u8, handler.hook.name, "lua."));
+    }
 }
 
 test "fx ask captured and quiet permission paths bypass terminal prompt" {
