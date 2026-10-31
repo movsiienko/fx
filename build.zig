@@ -105,8 +105,14 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run only the fx unit tests whose names contain this text; repeatable",
+    ) orelse &.{};
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
@@ -149,6 +155,9 @@ pub fn build(b: *std.Build) void {
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
     session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
+
+    const test_fx_step = b.step("test-fx", "Run fx's own unit tests; -Dtest-filter narrows them");
+    test_fx_step.dependOn(&run_exe_tests.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
