@@ -257,7 +257,7 @@ fn discover(a: Allocator, dir: std.Io.Dir) ![]Extension {
         const name = try a.dupe(u8, entry.name);
         try extensions.append(a, .{
             .name = name,
-            .problem = if (engine.validExtensionName(name)) null else "the folder name must be lowercase letters, digits, '_' or '-'",
+            .problem = if (engine.validExtensionName(name)) null else "the folder name must be lowercase letters, digits, '_' or '-', starting with a letter or digit",
         });
     }
     std.mem.sort(Extension, extensions.items, {}, extensionLessThan);
@@ -698,14 +698,19 @@ test "a broken folder or manifest makes the extension invalid" {
     try home.write("mismatch/manifest.lua", policy_manifest);
     try home.write("mismatch/main.lua", "");
     try home.write("Upper/manifest.lua", policy_manifest);
+    try home.write("-x/manifest.lua", policy_manifest);
     try home.write("nomain/manifest.lua", "return { name = \"nomain\", events = { \"stop\" } }");
 
     var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     defer catalog.deinit();
-    try std.testing.expectEqual(@as(usize, 4), catalog.extensions.len);
+    try std.testing.expectEqual(@as(usize, 5), catalog.extensions.len);
     try std.testing.expectEqualStrings("manifest.lua is missing", catalog.find("nomanifest").?.problem.?);
     try std.testing.expect(std.mem.find(u8, catalog.find("mismatch").?.problem.?, "does not match") != null);
     try std.testing.expect(std.mem.find(u8, catalog.find("Upper").?.problem.?, "folder name") != null);
+    try std.testing.expectEqualStrings(
+        "the folder name must be lowercase letters, digits, '_' or '-', starting with a letter or digit",
+        catalog.find("-x").?.problem.?,
+    );
     try std.testing.expectEqualStrings("the main file main.lua is missing", catalog.find("nomain").?.problem.?);
     for (catalog.extensions) |extension| try std.testing.expectEqual(listing.State.invalid, extension.state);
 }
