@@ -168,8 +168,6 @@ pub const Extension = struct {
     /// Held around each log write and around the stop, so no log line
     /// reaches the host after a call is abandoned.
     log_mutex: std.Io.Mutex = .init,
-    /// Scratch memory for the current call, inside the budget.
-    scratch: std.heap.ArenaAllocator,
     /// `state.json`, parsed once at load, inside the budget.
     kv_arena: std.heap.ArenaAllocator,
     kv_state: ?std.json.ObjectMap = null,
@@ -184,6 +182,8 @@ pub const Extension = struct {
     refs: std.EnumArray(Event, c_int) = .initFill(c.LUA_NOREF),
     tags: bridge.Tags = .{},
     loaded_ref: c_int = c.LUA_NOREF,
+    /// The metatable of the scratch memory `agent.json` converts in.
+    scratch_mt_ref: c_int = c.LUA_NOREF,
 
     /// Creates the sandbox and runs the extension's main file, which
     /// subscribes to hooks with `agent.on`. The caller owns the result and
@@ -220,7 +220,6 @@ pub const Extension = struct {
             .io = io,
             .budget = .init(gpa, options.limits.memory_bytes),
             .L = undefined,
-            .scratch = undefined,
             .kv_arena = undefined,
             .name = name,
             .main = main,
@@ -230,11 +229,9 @@ pub const Extension = struct {
             .limits = options.limits,
             .log = options.log,
         };
-        self.scratch = .init(self.budget.allocator());
         self.kv_arena = .init(self.budget.allocator());
         self.L = c.lua_newstate(budget_mod.luaAlloc, &self.budget) orelse {
             self.kv_arena.deinit();
-            self.scratch.deinit();
             return error.OutOfMemory;
         };
         self.meter.attach(self.L);
@@ -268,7 +265,6 @@ pub const Extension = struct {
         // `setmetatable` refuses `__gc`, so closing runs no extension code.
         c.lua_close(self.L);
         self.kv_arena.deinit();
-        self.scratch.deinit();
         freeFiles(gpa, self.files);
         gpa.free(self.main);
         gpa.free(self.name);
@@ -308,9 +304,6 @@ pub const Extension = struct {
             }
             return error.InvalidInput;
         };
-        // Scratch memory counts against the budget, so keep little of it.
-        _ = self.scratch.reset(.{ .retain_with_limit = 64 * 1024 });
-
         const L = self.L;
         var job = CallJob{ .ext = self, .ref = ref, .input = input };
         self.runProtected(callHandler, &job, true, diagnostic) catch |err| switch (err) {
@@ -565,6 +558,10 @@ fn setupState(L: ?*c.State) callconv(.c) c_int {
     ext.tags.array_mt_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
     c.newTable(L);
     ext.loaded_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    c.newTable(L);
+    pushExtFunction(L, ext, closeScratch);
+    c.lua_setfield(L, -2, "__close");
+    ext.scratch_mt_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
 
     pushExtFunction(L, ext, luaRequire);
     c.lua_setglobal(L, "require");
@@ -683,24 +680,56 @@ fn writeLog(ext: *Extension, level: LogLevel, message: []const u8) void {
     ext.log.write(ext.log.ctx, ext.name, level, message[0..end]);
 }
 
+/// Pushes a to-be-closed userdata that owns an arena inside the budget,
+/// and returns the arena. Closing the slot frees the arena, and so does an
+/// error that unwinds past it, so a conversion that raises leaks nothing.
+fn pushScratch(L: ?*c.State, ext: *Extension) *std.heap.ArenaAllocator {
+    const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(c.lua_newuserdatauv(L, @sizeOf(std.heap.ArenaAllocator), 0).?));
+    arena.* = .init(ext.budget.allocator());
+    _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, ext.scratch_mt_ref);
+    _ = c.lua_setmetatable(L, -2);
+    c.lua_toclose(L, -1);
+    return arena;
+}
+
+fn closeScratch(L: ?*c.State) callconv(.c) c_int {
+    const ext = extFrom(L);
+    const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(c.lua_touserdata(L, 1).?));
+    arena.deinit();
+    // Leave an empty arena, so a second close frees nothing.
+    arena.* = .init(ext.budget.allocator());
+    return 0;
+}
+
 fn jsonEncode(L: ?*c.State) callconv(.c) c_int {
     const ext = extFrom(L);
     c.lua_settop(L, 1);
-    var out: std.Io.Writer.Allocating = .init(ext.scratch.allocator());
-    bridge.encode(L, ext.tags, 1, &out, ext.limits.memory_bytes) catch |err|
+    const scratch = pushScratch(L, ext);
+    var out: std.Io.Writer.Allocating = .init(scratch.allocator());
+    bridge.encode(L, ext.tags, 1, &out, ext.limits.memory_bytes) catch |err| {
+        // Free the scratch first, so the error message has memory to use.
+        c.lua_closeslot(L, 2);
         raiseFmt(L, "agent.json.encode: {s}", .{bridge.describe(err)});
+    };
     c.pushString(L, out.written());
+    c.lua_closeslot(L, 2);
     return 1;
 }
 
 fn jsonDecode(L: ?*c.State) callconv(.c) c_int {
     const ext = extFrom(L);
+    c.lua_settop(L, 1);
     const text = c.stringAt(L, 1) orelse c.raise(L, "agent.json.decode: expected a string");
-    const value = std.json.parseFromSliceLeaky(std.json.Value, ext.scratch.allocator(), text, .{}) catch |err| switch (err) {
-        error.OutOfMemory => c.raise(L, "agent.json.decode: not enough memory"),
-        else => c.raise(L, "agent.json.decode: invalid JSON"),
+    const scratch = pushScratch(L, ext);
+    const value = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), text, .{}) catch |err| {
+        c.lua_closeslot(L, 2);
+        switch (err) {
+            error.OutOfMemory => c.raise(L, "agent.json.decode: not enough memory"),
+            else => c.raise(L, "agent.json.decode: invalid JSON"),
+        }
     };
     bridge.push(L, ext.tags, value);
+    c.lua_closeslot(L, 2);
     return 1;
 }
 
@@ -954,6 +983,81 @@ test "the memory cap stops a memory bomb and the state stays usable" {
     try expectCallFails(ext, .stop, "{}", error.HookFailed, "not enough memory");
     try std.testing.expect(ext.budget.used <= 1024 * 1024);
     try expectCall(ext, .post_turn_end, "{}", "\"yyy\"");
+}
+
+/// About 100 KB as JSON: 100 strings of 1000 bytes.
+const hundred_kb_table =
+    \\local big = {}
+    \\for i = 1, 100 do big[i] = string.rep("x", 1000) end
+;
+
+test "agent.json.encode in a loop releases its memory after each call" {
+    const ext = try loadForTest(hundred_kb_table ++
+        \\
+        \\agent.on("stop", function()
+        \\  local text
+        \\  for _ = 1, 50 do text = agent.json.encode(big) end
+        \\  return { continue = tostring(#text) }
+        \\end)
+    , &.{}, .{ .limits = .{ .timeout_ms = 60_000 } });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"100301"}
+    );
+}
+
+/// About 100 KB of JSON whose strings hold an escape, so decoding copies
+/// them: 100 strings of 998 bytes plus a newline.
+const hundred_kb_json =
+    \\local item = '"' .. string.rep("x", 998) .. '\\n"'
+    \\local text = "[" .. string.rep(item, 100, ",") .. "]"
+;
+
+test "agent.json.decode in a loop releases its memory after each call" {
+    const ext = try loadForTest(hundred_kb_json ++
+        \\
+        \\agent.on("stop", function()
+        \\  local value
+        \\  for _ = 1, 50 do value = agent.json.decode(text) end
+        \\  return { continue = #value .. ":" .. #value[100] }
+        \\end)
+    , &.{}, .{ .limits = .{ .timeout_ms = 60_000 } });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"100:999"}
+    );
+}
+
+test "agent.json in a loop while the extension loads keeps the load within memory" {
+    const ext = try loadForTest(hundred_kb_table ++ "\n" ++ hundred_kb_json ++
+        \\
+        \\local encoded, decoded
+        \\for _ = 1, 50 do encoded = agent.json.encode(big) end
+        \\for _ = 1, 50 do decoded = agent.json.decode(text) end
+        \\agent.on("stop", function() return { continue = #encoded .. ":" .. #decoded } end)
+    , &.{}, .{ .limits = .{ .timeout_ms = 60_000 } });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"100301:100"}
+    );
+}
+
+test "an agent.json.encode past the memory limit fails and gives its memory back" {
+    // Five references to one 1 MiB string encode to 5 MiB, past 4 MiB.
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local s = string.rep("x", 1024 * 1024)
+        \\  local ok, err = pcall(agent.json.encode, { s, s, s, s, s })
+        \\  local after = agent.json.encode({ string.rep("y", 256 * 1024) })
+        \\  return { continue = tostring(ok) .. "|" .. err .. "|" .. #after }
+        \\end)
+        \\agent.on("post_turn_end", function() return agent.json.encode({ "z" }) end)
+    , &.{}, .{ .limits = .{ .timeout_ms = 60_000 } });
+    defer ext.deinit();
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"false|agent.json.encode: not enough memory to encode the value|262148"}
+    );
+    try expectCall(ext, .post_turn_end, "{}", "\"[\\\"z\\\"]\"");
 }
 
 test {
