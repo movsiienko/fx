@@ -33,17 +33,23 @@ pub const Loaded = struct {
 
     /// Writes the failures not yet recorded and frees the Lua state.
     pub fn deinit(self: *Loaded) void {
-        const io = io_mod.getIo();
-        self.failures.mutex.lockUncancelable(io);
-        if (self.failures.pending > 0) self.writeFailures(io_mod.milliTimestamp());
-        self.failures.mutex.unlock(io);
+        self.flushFailures();
         for (&self.hooks.values) |*hook| hook.results.deinit(self.gpa);
         self.lua.deinit();
     }
 
+    /// Writes the failures not yet recorded. Runs no Lua and frees nothing,
+    /// so it is safe while hooks still run on other threads.
+    pub fn flushFailures(self: *Loaded) void {
+        const io = io_mod.getIo();
+        self.failures.mutex.lockUncancelable(io);
+        defer self.failures.mutex.unlock(io);
+        if (self.failures.pending > 0) self.writeFailures(io_mod.milliTimestamp());
+    }
+
     /// Counts one failed call. The first failure is recorded at once, so a
     /// crash still leaves a record; later ones at most once per interval
-    /// and when the session ends, so a hook that fails on every tool call
+    /// and when the process exits, so a hook that fails on every tool call
     /// does not read and sync a file each time.
     fn recordFailure(self: *Loaded, message: []const u8) void {
         const io = io_mod.getIo();

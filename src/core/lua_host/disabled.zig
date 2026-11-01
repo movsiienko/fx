@@ -32,6 +32,8 @@ pub const Hooks = struct {
         return .{};
     }
 
+    pub fn flushFailures(_: *Hooks) void {}
+
     pub fn deinit(_: *Hooks) void {}
 };
 

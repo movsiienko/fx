@@ -903,6 +903,11 @@ const App = struct {
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
+        // Lua states are left for process exit like other memory, but the
+        // failures their hooks held back are durable state. The worker has
+        // stopped, so its turns count no more of them.
+        self.lua_hooks.flushFailures();
+        shutdown_trace.mark("lua_failures_recorded");
 
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);

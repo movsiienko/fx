@@ -10,12 +10,21 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import {
+  fakeGatewayFinalText,
+  fakeGatewaySse,
+  fakeGatewayTitleDefault,
+  startFakeGateway as startTuiGateway,
+  TITLE_GENERATION_MARKER,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 // Lua extension hooks end to end: review before running, a blocking hook, an
 // argument rewrite, a crashing hook, an instruction budget overrun, and a
 // call into Lua's C library that runs past the time limit, all through
-// `fx ask` against a fake gateway.
+// `fx ask` against a fake gateway, and failures counted in the interactive
+// app that reach the record when it quits.
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -35,6 +44,7 @@ const MAIN = `agent.on("pre_tool_use", function(ev)
   if path:find("secret") then return { block = "policy forbids reading " .. path } end
   if path == "redirect.txt" then return { arguments = { path = "public.txt" } } end
   if path == "crash.txt" then error("kaboom") end
+  if path:find("^crash%d") then error("kaboom " .. path) end
   if path == "spin.txt" then while true do end end
   if path == "slow.txt" then string.rep("a", 900):find(".-.-b") end
 end)
@@ -243,6 +253,61 @@ describe("Lua extension hooks", () => {
         const off = await askToRead(root, "crash.txt");
         expect(off.toolResult).not.toContain("Lua hook");
       } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "failures held back in the interactive app are recorded when it quits",
+    async () => {
+      const root = createRoot();
+      // The first failure is written at once and the rest within the same
+      // second are held back, so only quitting can record them.
+      const paths = ["crash1.txt", "crash2.txt", "crash3.txt", "crash4.txt", "crash5.txt"];
+      const gateway = startTuiGateway(
+        [
+          fakeGatewaySse([
+            ...paths.map((path, i) => ({
+              type: "tool-call",
+              toolCallId: `read_${i + 1}`,
+              toolName: "read_file",
+              input: JSON.stringify({ path }),
+            })),
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          fakeGatewayFinalText("LUA_TUI_TURN_DONE"),
+        ],
+        { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+      );
+      let session: TmuxSession | undefined;
+      try {
+        writeFileSync(join(root.extension, "manifest.lua"), MANIFEST.replace(`scopes = { "ask" }`, `scopes = { "interactive" }`));
+        expect((await extensions(root, ["trust", "policy"])).code).toBe(0);
+
+        const stderr = join(root.root, "stderr.log");
+        session = await TmuxSession.create({
+          cwd: root.workspace,
+          env: env(root, gateway),
+          stderrPath: stderr,
+          remainOnExit: true,
+        });
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("Read the crash files.");
+        await session.waitForText("LUA_TUI_TURN_DONE", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("/quit");
+        await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+        expect(session.paneStatus().status).toBe(0);
+        expect(readFileSync(stderr, "utf8")).toBe("");
+
+        const listed = await extensions(root, ["list"]);
+        expect(listed.json.extensions[0]).toMatchObject({ state: "failing", failures: 5 });
+        expect(listed.json.extensions[0].last_error).toContain("kaboom crash5.txt");
+      } finally {
+        await session?.kill();
+        gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

@@ -140,8 +140,15 @@ pub const Hooks = struct {
         };
     }
 
-    /// Frees the extensions. The hook runtime must no longer dispatch to
-    /// them.
+    /// Writes the failures each extension has counted but not yet
+    /// recorded. For an exit that skips `deinit`: it runs no Lua, frees
+    /// nothing, and hooks may still run.
+    pub fn flushFailures(self: *Hooks) void {
+        for (self.loaded.items) |loaded| loaded.flushFailures();
+    }
+
+    /// Frees the extensions, after writing their unrecorded failures. The
+    /// hook runtime must no longer dispatch to them.
     pub fn deinit(self: *Hooks) void {
         for (self.loaded.items) |loaded| {
             loaded.deinit();
