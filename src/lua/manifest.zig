@@ -58,21 +58,21 @@ fn evaluate(
     diagnostic: *types.Diagnostic,
 ) ParseError![]const u8 {
     var budget = budget_mod.Budget.init(gpa, manifest_memory_bytes);
+    var meter: types.Meter = .{};
     const L = c.lua_newstate(budget_mod.luaAlloc, &budget) orelse return error.OutOfMemory;
-    defer {
-        // Finalizers run at close; the budget stops a loop in one.
-        types.armInstructionBudget(L, manifest_instructions);
-        c.lua_close(L);
-    }
+    meter.attach(L);
+    // With no libraries open, a manifest cannot set a finalizer or call into
+    // Lua's C library, so the instruction budget bounds all of its work.
+    defer c.lua_close(L);
 
     const load_status = c.luaL_loadbufferx(L, bytes.ptr, bytes.len, "=manifest.lua", "t");
     if (load_status != c.LUA_OK) {
         diagnostic.capture(L, load_status);
         return error.InvalidManifest;
     }
-    types.armInstructionBudget(L, manifest_instructions);
+    meter.arm(L, manifest_instructions);
     const status = c.pcall(L, 0, 1);
-    types.disarmInstructionBudget(L);
+    meter.disarm(L);
     if (status != c.LUA_OK) {
         diagnostic.capture(L, status);
         return error.InvalidManifest;
@@ -186,6 +186,16 @@ fn parseLimits(value: std.json.Value, diagnostic: *types.Diagnostic) ParseError!
                 });
             }
             limits.instructions_per_call = @intCast(number.integer);
+        } else if (std.mem.eql(u8, key, "timeout_ms")) {
+            if (number != .integer or number.integer < types.Limits.min_timeout_ms or
+                number.integer > types.Limits.max_timeout_ms)
+            {
+                return invalid(diagnostic, "manifest limits.timeout_ms must be a whole number from {d} to {d}", .{
+                    types.Limits.min_timeout_ms,
+                    types.Limits.max_timeout_ms,
+                });
+            }
+            limits.timeout_ms = @intCast(number.integer);
         } else {
             return invalid(diagnostic, "manifest limits field '{s}' is not recognized", .{key});
         }
@@ -241,7 +251,7 @@ test "a manifest table becomes a typed manifest" {
         \\  events = { "pre_tool_use", "stop" },
         \\  scopes = { "interactive", "ask", "acp", "subagent" },
         \\  kv = true,
-        \\  limits = { memory_mb = 2, instructions_per_call = 100000 },
+        \\  limits = { memory_mb = 2, instructions_per_call = 100000, timeout_ms = 250 },
         \\}
     , &diagnostic);
     try std.testing.expectEqualStrings("policy", manifest.name);
@@ -253,6 +263,7 @@ test "a manifest table becomes a typed manifest" {
     try std.testing.expect(manifest.kv);
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), manifest.limits.memory_bytes);
     try std.testing.expectEqual(@as(u32, 100000), manifest.limits.instructions_per_call);
+    try std.testing.expectEqual(@as(u32, 250), manifest.limits.timeout_ms);
 }
 
 test "a manifest leaves subagents out unless it lists them" {
@@ -261,6 +272,7 @@ test "a manifest leaves subagents out unless it lists them" {
     try std.testing.expect(manifest.scopes.contains(.interactive));
     try std.testing.expect(!manifest.scopes.contains(.subagent));
     try std.testing.expectEqual(types.Limits.default_instructions_per_call, manifest.limits.instructions_per_call);
+    try std.testing.expectEqual(@as(u32, 1000), manifest.limits.timeout_ms);
 }
 
 test "manifest errors name the problem" {
@@ -272,6 +284,9 @@ test "manifest errors name the problem" {
         .{ .source = "return { name = \"x\", events = { \"stop\" }, typo = 1 }", .message = "'typo' is not recognized" },
         .{ .source = "return { name = \"x\", events = { \"stop\" }, main = \"../escape.lua\" }", .message = "manifest main" },
         .{ .source = "return { name = \"x\", events = { \"stop\" }, limits = { memory_mb = 9000 } }", .message = "memory_mb" },
+        .{ .source = "return { name = \"x\", events = { \"stop\" }, limits = { timeout_ms = 5 } }", .message = "timeout_ms must be a whole number from 10 to 60000" },
+        .{ .source = "return { name = \"x\", events = { \"stop\" }, limits = { timeout_ms = 60001 } }", .message = "timeout_ms" },
+        .{ .source = "return { name = \"x\", events = { \"stop\" }, limits = { timeout_ms = 1.5 } }", .message = "timeout_ms" },
         .{ .source = "return {", .message = "manifest.lua:1:" },
         .{ .source = "while true do end", .message = "instruction budget exceeded" },
         .{ .source = "local t = {} for i = 1, 1e9 do t[i] = i end", .message = "not enough memory" },

@@ -13,8 +13,9 @@ import { runFx } from "../evals/eval-helpers";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 // Lua extension hooks end to end: review before running, a blocking hook, an
-// argument rewrite, a crashing hook, and an instruction budget overrun, all
-// through `fx ask` against a fake gateway.
+// argument rewrite, a crashing hook, an instruction budget overrun, and a
+// call into Lua's C library that runs past the time limit, all through
+// `fx ask` against a fake gateway.
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -24,7 +25,7 @@ const MANIFEST = `return {
   version = "0.1.0",
   events = { "pre_tool_use" },
   scopes = { "ask" },
-  limits = { instructions_per_call = 200000 },
+  limits = { instructions_per_call = 200000, timeout_ms = 200 },
 }
 `;
 
@@ -35,6 +36,7 @@ const MAIN = `agent.on("pre_tool_use", function(ev)
   if path == "redirect.txt" then return { arguments = { path = "public.txt" } } end
   if path == "crash.txt" then error("kaboom") end
   if path == "spin.txt" then while true do end end
+  if path == "slow.txt" then string.rep("a", 900):find(".-.-b") end
 end)
 `;
 
@@ -102,6 +104,7 @@ function createRoot() {
   writeFileSync(join(workspace, "public.txt"), "public contents\n");
   writeFileSync(join(workspace, "secret.txt"), "secret contents\n");
   writeFileSync(join(workspace, "redirect.txt"), "redirect contents\n");
+  writeFileSync(join(workspace, "slow.txt"), "slow contents\n");
   return { root, home, workspace, extension };
 }
 
@@ -186,6 +189,7 @@ describe("Lua extension hooks", () => {
           runs: false,
           events: ["pre_tool_use"],
           scopes: ["ask"],
+          timeout_ms: 200,
           files: 2,
         });
 
@@ -238,6 +242,36 @@ describe("Lua extension hooks", () => {
         expect(disabled.json.extensions[0]).toMatchObject({ state: "disabled", runs: false });
         const off = await askToRead(root, "crash.txt");
         expect(off.toolResult).not.toContain("Lua hook");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  test(
+    "a hook that runs past its time limit blocks the call and stops the extension",
+    async () => {
+      const root = createRoot();
+      try {
+        expect((await extensions(root, ["trust", "policy"])).code).toBe(0);
+
+        const started = Date.now();
+        const slow = await askToRead(root, "slow.txt");
+        // The pattern takes seconds; fx gives up after 200 ms and exits.
+        expect(Date.now() - started).toBeLessThan(TIMEOUT);
+        expect(slow.result.stderr).not.toContain("panic");
+        expect(slow.toolResult).toContain("Lua hook lua.policy.pre_tool_use failed");
+        expect(slow.toolResult).toContain("ran past its 200 ms time limit");
+        expect(slow.toolResult).not.toContain("slow contents");
+
+        const listed = await extensions(root, ["list"]);
+        expect(listed.json.extensions[0]).toMatchObject({ state: "failing", runs: true, failures: 1 });
+        expect(listed.json.extensions[0].last_error).toContain("time limit");
+
+        // A new fx process starts the extension again.
+        const blocked = await askToRead(root, "secret.txt");
+        expect(blocked.toolResult).toContain("policy forbids reading secret.txt");
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

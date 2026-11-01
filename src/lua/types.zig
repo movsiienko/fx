@@ -29,9 +29,15 @@ pub const Limits = struct {
     pub const default_instructions_per_call: u32 = 5_000_000;
     pub const min_instructions_per_call: u32 = 1_000;
     pub const max_instructions_per_call: u32 = 1_000_000_000;
+    pub const default_timeout_ms: u32 = 1_000;
+    pub const min_timeout_ms: u32 = 10;
+    pub const max_timeout_ms: u32 = 60_000;
 
     memory_bytes: usize = default_memory_bytes,
     instructions_per_call: u32 = default_instructions_per_call,
+    /// Wall-clock time one call may take, including the time Lua's C
+    /// library spends where the instruction budget cannot reach.
+    timeout_ms: u32 = default_timeout_ms,
 };
 
 /// A readable reason for the last failure, kept in a fixed buffer so a
@@ -74,20 +80,62 @@ pub const Diagnostic = struct {
     }
 };
 
-/// Count hook for the instruction budget. Once the budget is spent it fires
-/// on every instruction, so a `pcall` in the extension cannot catch the
-/// error and keep running.
-fn onInstructionBudget(L: ?*c.State, _: ?*c.Debug) callconv(.c) void {
-    c.lua_sethook(L, onInstructionBudget, c.LUA_MASKCOUNT, 1);
-    c.raise(L, "instruction budget exceeded");
-}
+/// Meters a state's Lua instructions. The count hook fires every
+/// `check_interval` instructions, so it notices both a spent budget and a
+/// `stop` from another thread soon after either happens. Once it raises an
+/// error it fires on every instruction, so a `pcall` in the extension
+/// cannot catch the error and keep running.
+///
+/// Lua does not run the hook inside a C function, so neither a budget nor a
+/// stop interrupts a long call into Lua's C library: the caller's time limit
+/// covers that.
+pub const Meter = struct {
+    const check_interval: u32 = 1_000;
 
-pub fn armInstructionBudget(L: ?*c.State, instructions: u32) void {
-    c.lua_sethook(L, onInstructionBudget, c.LUA_MASKCOUNT, @intCast(@min(instructions, std.math.maxInt(c_int))));
-}
+    instructions_left: u32 = 0,
+    stopped: std.atomic.Value(bool) = .init(false),
 
-pub fn disarmInstructionBudget(L: ?*c.State) void {
-    c.lua_sethook(L, null, 0, 0);
+    /// Makes `L` find this meter from its count hook. Call once, right after
+    /// the state is created.
+    pub fn attach(self: *Meter, L: ?*c.State) void {
+        c.extraSpace(L).* = self;
+    }
+
+    /// Gives the next run `instructions` instructions.
+    pub fn arm(self: *Meter, L: ?*c.State, instructions: u32) void {
+        const step = @min(instructions, check_interval);
+        self.instructions_left = instructions - step;
+        c.lua_sethook(L, onCount, c.LUA_MASKCOUNT, @intCast(step));
+    }
+
+    pub fn disarm(_: *Meter, L: ?*c.State) void {
+        c.lua_sethook(L, null, 0, 0);
+    }
+
+    /// Makes the state raise an error at its next Lua instruction. Safe to
+    /// call from any thread.
+    pub fn stop(self: *Meter) void {
+        self.stopped.store(true, .release);
+    }
+
+    pub fn isStopped(self: *const Meter) bool {
+        return self.stopped.load(.acquire);
+    }
+};
+
+fn onCount(L: ?*c.State, _: ?*c.Debug) callconv(.c) void {
+    const meter: *Meter = @ptrCast(@alignCast(c.extraSpace(L).*.?));
+    if (meter.isStopped()) {
+        c.lua_sethook(L, onCount, c.LUA_MASKCOUNT, 1);
+        c.raise(L, "the hook ran past its time limit");
+    }
+    if (meter.instructions_left == 0) {
+        c.lua_sethook(L, onCount, c.LUA_MASKCOUNT, 1);
+        c.raise(L, "instruction budget exceeded");
+    }
+    const step = @min(meter.instructions_left, Meter.check_interval);
+    meter.instructions_left -= step;
+    c.lua_sethook(L, onCount, c.LUA_MASKCOUNT, @intCast(step));
 }
 
 test "diagnostics keep UTF-8 whole when they truncate" {

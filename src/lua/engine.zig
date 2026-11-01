@@ -1,12 +1,23 @@
 //! The sandboxed Lua 5.4 engine behind fx's Lua hooks. This file is the
 //! engine's front door: code outside `src/lua/` imports only this file, and
-//! the engine imports only the standard library and the vendored Lua C
-//! source. `scripts/check-lua-boundary.sh` enforces both rules.
+//! the engine imports only the standard library and Lua's C API.
+//! `scripts/check-lua-boundary.sh` enforces both rules.
 //!
 //! Each extension gets its own `lua_State` with a memory cap, an instruction
-//! budget per call, and only the `base`, `string`, `table`, `math` and `utf8`
-//! libraries. The host hands in every file the extension may load, so the
-//! engine never reads the filesystem: what the user trusted is what runs.
+//! budget per call, a time limit per call, and only the `base`, `string`,
+//! `table`, `math` and `utf8` libraries. The host hands in every file the
+//! extension may load, so the engine never reads the filesystem: what the
+//! user trusted is what runs.
+//!
+//! fx builds stock Lua. A few library functions can loop for a long time
+//! inside one C call, where the instruction budget does not reach: pattern
+//! matching, a plain `string.find`, and loops over a huge range or a
+//! huge `__len`. The engine bounds them without patching Lua. The bootstrap
+//! below wraps the functions whose loops could otherwise run for years,
+//! `setmetatable` refuses `__gc` (Lua runs finalizers with hooks off), and
+//! every call runs on a worker thread under the extension's time limit. A
+//! call that misses it is abandoned: the extension is stopped for the rest
+//! of the session, and the worker frees it once Lua's C code returns.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -60,13 +71,81 @@ const LoadOptions = struct {
 };
 
 const LoadError = error{ OutOfMemory, LoadFailed };
-const CallError = error{ OutOfMemory, InvalidInput, HookFailed, InvalidResult };
+const CallError = error{ OutOfMemory, InvalidInput, HookFailed, InvalidResult, TimedOut };
+const RunError = error{ OutOfMemory, LoadFailed, TimedOut };
 
+/// Worker threads run Lua's C code and fx's own C functions, none of which
+/// recurse deeply: Lua caps its C recursion at `LUAI_MAXCCALLS`.
+const worker_stack_bytes = 4 * 1024 * 1024;
+
+/// Workers still running, including abandoned ones. Tests wait for it to
+/// reach zero so the testing allocator sees every extension freed.
+var live_workers: std.atomic.Value(usize) = .init(0);
+
+/// Runs before the extension's own code, so it captures the stock
+/// functions first. The wrappers fail fast where stock Lua would loop in C
+/// for longer than any time limit: `string.rep` of an empty result, and
+/// table functions over a range or a `__len` far past what memory can hold.
+/// A real table never comes near `limit`, because the memory cap is 64 MiB.
 const bootstrap =
     \\local raw_load = load
     \\load = function(chunk, chunkname, _, ...)
     \\  if select("#", ...) > 0 then return raw_load(chunk, chunkname, "t", ...) end
     \\  return raw_load(chunk, chunkname, "t")
+    \\end
+    \\
+    \\local error, type, rawget, tonumber, tointeger = error, type, rawget, tonumber, math.tointeger
+    \\local raw_setmetatable = setmetatable
+    \\setmetatable = function(t, mt)
+    \\  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+    \\    error("setmetatable: fx extensions cannot use __gc finalizers", 2)
+    \\  end
+    \\  return raw_setmetatable(t, mt)
+    \\end
+    \\
+    \\local limit = 1 << 24
+    \\local function int(x)
+    \\  if x == nil then return nil end
+    \\  return tointeger(tonumber(x))
+    \\end
+    \\local function too_wide(first, last)
+    \\  return first and last and last >= first and (last - first >= limit or last - first < 0)
+    \\end
+    \\local function check_length(name, list)
+    \\  if type(list) ~= "table" then return end
+    \\  local n = int(#list)
+    \\  if n and n >= limit then error("table." .. name .. ": the table is too long", 3) end
+    \\end
+    \\
+    \\local rep = string.rep
+    \\string.rep = function(s, n, sep)
+    \\  if s == "" and (sep == nil or sep == "") and int(n) then return "" end
+    \\  return rep(s, n, sep)
+    \\end
+    \\
+    \\local move, concat, insert, remove, sort = table.move, table.concat, table.insert, table.remove, table.sort
+    \\table.move = function(a1, f, e, t, a2)
+    \\  if too_wide(int(f), int(e)) then error("table.move: too many elements to move", 2) end
+    \\  return move(a1, f, e, t, a2)
+    \\end
+    \\table.concat = function(list, sep, i, j)
+    \\  local first = i == nil and 1 or int(i)
+    \\  local last
+    \\  if j ~= nil then last = int(j) elseif type(list) == "table" then last = int(#list) end
+    \\  if too_wide(first, last) then error("table.concat: too many elements to concatenate", 2) end
+    \\  return concat(list, sep, i, j)
+    \\end
+    \\table.insert = function(list, ...)
+    \\  check_length("insert", list)
+    \\  return insert(list, ...)
+    \\end
+    \\table.remove = function(list, ...)
+    \\  check_length("remove", list)
+    \\  return remove(list, ...)
+    \\end
+    \\table.sort = function(list, ...)
+    \\  check_length("sort", list)
+    \\  return sort(list, ...)
     \\end
 ;
 
@@ -75,7 +154,16 @@ pub const Extension = struct {
     io: std.Io,
     budget: budget_mod.Budget,
     L: *c.State,
+    meter: types.Meter = .{},
+    /// Serializes calls. Held by the caller, never by a worker.
     mutex: std.Io.Mutex = .init,
+    /// One for the owner plus one for each running worker. Whoever lets go
+    /// last frees the extension, so an abandoned worker never touches freed
+    /// memory.
+    holders: std.atomic.Value(u32) = .init(1),
+    /// Held around each log write and around the stop, so no log line
+    /// reaches the host after a call is abandoned.
+    log_mutex: std.Io.Mutex = .init,
     /// Scratch memory for the current call, inside the budget.
     scratch: std.heap.ArenaAllocator,
     /// `state.json`, parsed once at load, inside the budget.
@@ -102,6 +190,18 @@ pub const Extension = struct {
         options: LoadOptions,
         diagnostic: *Diagnostic,
     ) LoadError!*Extension {
+        const self = try create(gpa, io, options);
+        errdefer self.release();
+
+        if (self.kv) try self.loadKvState(diagnostic);
+        self.runLoadStep(setupState, diagnostic) catch |err| return loadError(err);
+        self.loading = true;
+        self.runLoadStep(loadMain, diagnostic) catch |err| return loadError(err);
+        self.loading = false;
+        return self;
+    }
+
+    fn create(gpa: Allocator, io: std.Io, options: LoadOptions) Allocator.Error!*Extension {
         const self = try gpa.create(Extension);
         errdefer gpa.destroy(self);
         const name = try gpa.dupe(u8, options.name);
@@ -133,31 +233,42 @@ pub const Extension = struct {
             self.scratch.deinit();
             return error.OutOfMemory;
         };
-        errdefer self.close();
-
-        if (self.kv) try self.loadKvState(diagnostic);
-        try self.runProtected(setupState, self, diagnostic);
-        self.loading = true;
-        defer self.loading = false;
-        try self.runProtected(loadMain, self, diagnostic);
+        self.meter.attach(self.L);
         return self;
     }
 
+    fn runLoadStep(self: *Extension, function: c.CFunction, diagnostic: *Diagnostic) RunError!void {
+        try self.runProtected(function, self, false, diagnostic);
+        c.lua_settop(self.L, 0);
+    }
+
+    fn loadError(err: RunError) LoadError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.LoadFailed, error.TimedOut => error.LoadFailed,
+        };
+    }
+
+    /// Lets go of the extension. When a call that missed its time limit is
+    /// still running, its worker frees the extension after it returns.
     pub fn deinit(self: *Extension) void {
+        self.release();
+    }
+
+    fn release(self: *Extension) void {
+        if (self.holders.fetchSub(1, .acq_rel) == 1) self.destroy();
+    }
+
+    fn destroy(self: *Extension) void {
         const gpa = self.gpa;
-        self.close();
+        // `setmetatable` refuses `__gc`, so closing runs no extension code.
+        c.lua_close(self.L);
+        self.kv_arena.deinit();
+        self.scratch.deinit();
         freeFiles(gpa, self.files);
         gpa.free(self.main);
         gpa.free(self.name);
         gpa.destroy(self);
-    }
-
-    fn close(self: *Extension) void {
-        // Finalizers run at close; the budget stops a loop in one.
-        types.armInstructionBudget(self.L, self.limits.instructions_per_call);
-        c.lua_close(self.L);
-        self.kv_arena.deinit();
-        self.scratch.deinit();
     }
 
     pub fn subscribed(self: *const Extension, event: Event) bool {
@@ -169,7 +280,9 @@ pub const Extension = struct {
     /// `arena`, or null when it returned nothing. The result is at most
     /// `max_result_bytes` as JSON. Only the Lua copy of the input counts
     /// against the extension's memory limit. Safe to call from several
-    /// threads; calls into one extension run one at a time.
+    /// threads; calls into one extension run one at a time. A call that
+    /// runs past the time limit returns `TimedOut`, and so does every later
+    /// call to this extension.
     pub fn call(
         self: *Extension,
         arena: Allocator,
@@ -181,21 +294,30 @@ pub const Extension = struct {
         std.debug.assert(ref != c.LUA_NOREF);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.meter.isStopped()) return self.stoppedError(diagnostic);
 
-        const L = self.L;
-        defer c.lua_settop(L, 0);
-        // Scratch memory counts against the budget, so keep little of it.
-        _ = self.scratch.reset(.{ .retain_with_limit = 64 * 1024 });
         bridge.checkValue(input) catch |err| {
             diagnostic.print("hook input is not valid JSON ({s})", .{bridge.describe(err)});
             return error.InvalidInput;
         };
+        // Scratch memory counts against the budget, so keep little of it.
+        _ = self.scratch.reset(.{ .retain_with_limit = 64 * 1024 });
 
+        const L = self.L;
         var job = CallJob{ .ext = self, .ref = ref, .input = input };
-        self.runProtected(callHandler, &job, diagnostic) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.LoadFailed => error.HookFailed,
+        self.runProtected(callHandler, &job, true, diagnostic) catch |err| switch (err) {
+            // The abandoned worker may still be using the state.
+            error.TimedOut => return error.TimedOut,
+            error.OutOfMemory => {
+                c.lua_settop(L, 0);
+                return error.OutOfMemory;
+            },
+            error.LoadFailed => {
+                c.lua_settop(L, 0);
+                return error.HookFailed;
+            },
         };
+        defer c.lua_settop(L, 0);
         if (c.lua_type(L, -1) == c.LUA_TNIL) return null;
 
         return bridge.toValue(L, self.tags, -1, arena, max_result_bytes) catch |err| {
@@ -204,18 +326,68 @@ pub const Extension = struct {
         };
     }
 
-    /// Runs `function(job)` as a protected call under the instruction
-    /// budget, leaving its one result on the stack.
-    fn runProtected(self: *Extension, function: c.CFunction, job: *anyopaque, diagnostic: *Diagnostic) LoadError!void {
-        const L = self.L;
-        if (c.lua_checkstack(L, 2) == 0) return error.OutOfMemory;
-        c.pushCFunction(L, function);
-        c.lua_pushlightuserdata(L, job);
-        types.armInstructionBudget(L, self.limits.instructions_per_call);
-        const status = c.pcall(L, 1, 1);
-        types.disarmInstructionBudget(L);
-        if (status != c.LUA_OK) {
-            diagnostic.capture(L, status);
+    fn stoppedError(self: *const Extension, diagnostic: *Diagnostic) error{TimedOut} {
+        diagnostic.print("a call ran past the {d} ms time limit, so fx stopped this extension until it restarts", .{self.limits.timeout_ms});
+        return error.TimedOut;
+    }
+
+    /// Runs `function(job)` as a protected call under the instruction budget
+    /// on a worker thread, and waits at most `limits.timeout_ms` for it,
+    /// leaving its one result on the stack. When `job` holds the caller's
+    /// input, the worker reports when that input is in Lua, and the time
+    /// limit starts then, so the caller's memory is never read after this
+    /// returns. Past the limit, the worker is abandoned and owns the
+    /// extension until it returns, and nothing may touch the state.
+    fn runProtected(
+        self: *Extension,
+        function: c.CFunction,
+        job: *anyopaque,
+        job_holds_input: bool,
+        diagnostic: *Diagnostic,
+    ) RunError!void {
+        if (self.meter.isStopped()) return self.stoppedError(diagnostic);
+        const io = self.io;
+        const run = try self.gpa.create(Run);
+        run.* = .{ .ext = self, .function = function, .job = job, .job_holds_input = job_holds_input };
+        _ = self.holders.fetchAdd(1, .monotonic);
+        _ = live_workers.fetchAdd(1, .monotonic);
+        const thread = std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, Run.work, .{run}) catch {
+            _ = live_workers.fetchSub(1, .monotonic);
+            _ = self.holders.fetchSub(1, .monotonic);
+            self.gpa.destroy(run);
+            diagnostic.set("fx could not start a thread to run the extension");
+            return error.LoadFailed;
+        };
+
+        const cancel_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(cancel_protection);
+        run.input_taken.waitUncancelable(io);
+        const deadline = (std.Io.Timeout{ .duration = .{
+            .raw = .fromMilliseconds(self.limits.timeout_ms),
+            .clock = .awake,
+        } }).toDeadline(io);
+        while (!run.finished.isSet()) {
+            // A timeout may also be a spurious wakeup, so check the clock.
+            run.finished.waitTimeout(io, deadline) catch {};
+            if (run.finished.isSet()) break;
+            const left = deadline.toDurationFromNow(io) orelse break;
+            if (left.raw.nanoseconds <= 0) break;
+        }
+
+        if (!run.finished.isSet() and run.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) {
+            self.log_mutex.lockUncancelable(io);
+            self.meter.stop();
+            self.log_mutex.unlock(io);
+            thread.detach();
+            diagnostic.print("the hook ran past its {d} ms time limit, so fx stopped this extension until it restarts", .{self.limits.timeout_ms});
+            return error.TimedOut;
+        }
+        run.finished.waitUncancelable(io);
+        thread.join();
+        defer self.gpa.destroy(run);
+        if (run.status != c.LUA_OK) {
+            // Running out of the extension's own memory is its failure.
+            diagnostic.set(run.diagnostic.message());
             return error.LoadFailed;
         }
     }
@@ -281,10 +453,62 @@ const CallJob = struct {
     input: std.json.Value,
 };
 
+/// One protected call on a worker thread. The caller and the worker share
+/// it; whichever of them is last frees it.
+const Run = struct {
+    ext: *Extension,
+    function: c.CFunction,
+    /// Valid only until `input_taken` is set.
+    job: *anyopaque,
+    job_holds_input: bool,
+    status: c_int = c.LUA_OK,
+    diagnostic: Diagnostic = .{},
+    /// Set once the worker no longer reads `job`.
+    input_taken: std.Io.Event = .unset,
+    finished: std.Io.Event = .unset,
+    state: std.atomic.Value(State) = .init(.running),
+
+    const State = enum(u8) { running, finished, abandoned };
+
+    fn work(run: *Run) void {
+        defer _ = live_workers.fetchSub(1, .monotonic);
+        const ext = run.ext;
+        const io = ext.io;
+        const L = ext.L;
+        if (!run.job_holds_input) run.input_taken.set(io);
+        if (c.lua_checkstack(L, 2) == 0) {
+            run.status = c.LUA_ERRMEM;
+            run.diagnostic.set("not enough memory (the extension's memory limit)");
+        } else {
+            c.pushCFunction(L, run.function);
+            c.lua_pushlightuserdata(L, run);
+            ext.meter.arm(L, ext.limits.instructions_per_call);
+            run.status = c.pcall(L, 1, 1);
+            ext.meter.disarm(L);
+            if (run.status != c.LUA_OK) run.diagnostic.capture(L, run.status);
+        }
+        run.input_taken.set(io);
+        if (run.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) != null) {
+            // The caller gave up on this run and left the extension to it.
+            c.lua_settop(L, 0);
+            ext.gpa.destroy(run);
+            ext.release();
+            return;
+        }
+        run.finished.set(io);
+        ext.release();
+    }
+};
+
 // Everything below runs inside a protected call. Lua raises errors with
 // `longjmp`, so these functions hold nothing that needs cleaning up.
 
 fn jobFrom(comptime T: type, L: ?*c.State) *T {
+    const run: *Run = @ptrCast(@alignCast(c.lua_touserdata(L, 1).?));
+    return @ptrCast(@alignCast(run.job));
+}
+
+fn runFrom(L: ?*c.State) *Run {
     return @ptrCast(@alignCast(c.lua_touserdata(L, 1).?));
 }
 
@@ -382,9 +606,13 @@ fn loadMain(L: ?*c.State) callconv(.c) c_int {
 }
 
 fn callHandler(L: ?*c.State) callconv(.c) c_int {
+    const run = runFrom(L);
     const job = jobFrom(CallJob, L);
+    const ext = job.ext;
     _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, job.ref);
-    bridge.push(L, job.ext.tags, job.input);
+    bridge.push(L, ext.tags, job.input);
+    // From here on nothing reads the caller's input, and its time starts.
+    run.input_taken.set(ext.io);
     c.call(L, 1, 1);
     return 1;
 }
@@ -437,6 +665,10 @@ fn luaPrint(L: ?*c.State) callconv(.c) c_int {
 fn writeLog(ext: *Extension, level: LogLevel, message: []const u8) void {
     var end = @min(message.len, max_log_bytes);
     while (end < message.len and end > 0 and (message[end] & 0xC0) == 0x80) end -= 1;
+    ext.log_mutex.lockUncancelable(ext.io);
+    defer ext.log_mutex.unlock(ext.io);
+    // An abandoned call's host may be gone.
+    if (ext.meter.isStopped()) return;
     ext.log.write(ext.log.ctx, ext.name, level, message[0..end]);
 }
 
@@ -711,29 +943,97 @@ test "the memory cap stops a memory bomb and the state stays usable" {
     try expectCall(ext, .post_turn_end, "{}", "\"yyy\"");
 }
 
-test "a backtracking pattern is cut off inside its C call" {
-    const ext = try loadForTest(
-        \\agent.on("stop", function()
-        \\  local s = string.rep("a", 4000)
-        \\  return { continue = tostring(s:find(".-.-.-.-b")) }
-        \\end)
-    , &.{}, .{ .limits = .{ .memory_bytes = 2 * 1024 * 1024, .instructions_per_call = 1_000_000 } });
-    defer ext.deinit();
-    try expectCallFails(ext, .stop, "{}", error.HookFailed, "pattern too complex");
+test {
+    _ = bridge;
+    _ = budget_mod;
+    _ = manifest_mod;
+    _ = types;
 }
 
-test "a worst-case plain find is cut off inside its C call" {
-    // Every position of s starts a 4 MiB near match, so a search that
-    // compares the whole needle at each one does about 2^44 byte compares.
+/// Waits for abandoned workers to finish and free their extensions, so the
+/// testing allocator sees no leak.
+fn waitForWorkers() !void {
+    var waited_ms: u32 = 0;
+    while (live_workers.load(.acquire) != 0) : (waited_ms += 10) {
+        if (waited_ms > 120_000) return error.TestWorkerStillRunning;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+test "a pattern that backtracks for seconds is stopped at the time limit" {
     const ext = try loadForTest(
-        \\local s = string.rep("a", 8 * 1024 * 1024)
-        \\local p = string.rep("a", 4 * 1024 * 1024) .. "b"
+        \\agent.on("stop", function()
+        \\  local s = string.rep("a", 600)
+        \\  return { continue = tostring(s:find(".-.-b")) }
+        \\end)
+        \\agent.on("post_turn_end", function() return { ok = true } end)
+    , &.{}, .{ .limits = .{ .memory_bytes = 2 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 } });
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    try expectCallFails(ext, .stop, "{}", error.TimedOut, "ran past its 10 ms time limit");
+    const elapsed = started.untilNow(std.testing.io, .awake);
+    try std.testing.expect(elapsed.toMilliseconds() < 5_000);
+    // The extension stays stopped, even for a hook that would be quick.
+    try expectCallFails(ext, .post_turn_end, "{}", error.TimedOut, "stopped this extension until it restarts");
+    ext.deinit();
+    try waitForWorkers();
+}
+
+test "a worst-case plain find is stopped at the time limit" {
+    const ext = try loadForTest(
+        \\local s = string.rep("a", 1024 * 1024)
+        \\local p = string.rep("a", 2048) .. "b"
         \\agent.on("stop", function() return { continue = tostring(s:find(p, 1, true)) } end)
-        \\agent.on("post_turn_end", function() return { continue = tostring(s:find(p)) } end)
-    , &.{}, .{ .limits = .{ .memory_bytes = 32 * 1024 * 1024, .instructions_per_call = 1_000_000 } });
+    , &.{}, .{ .limits = .{ .memory_bytes = 8 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 } });
+    try expectCallFails(ext, .stop, "{}", error.TimedOut, "time limit");
+    ext.deinit();
+    try waitForWorkers();
+}
+
+test "main code that runs past the time limit fails the load" {
+    var diagnostic: Diagnostic = .{};
+    const files = [_]SourceFile{.{ .path = "main.lua", .bytes =
+        \\local s = string.rep("a", 600)
+        \\s:find(".-.-b")
+    }};
+    try std.testing.expectError(error.LoadFailed, Extension.load(std.testing.allocator, std.testing.io, .{
+        .name = "test",
+        .files = &files,
+        .events = .full,
+        .limits = .{ .timeout_ms = 10 },
+    }, &diagnostic));
+    try std.testing.expect(std.mem.find(u8, diagnostic.message(), "ran past its 10 ms time limit") != null);
+    try waitForWorkers();
+}
+
+test "a stopped extension writes no more log lines" {
+    var log: TestLog = .{};
+    defer log.lines.deinit(std.testing.allocator);
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  print("before")
+        \\  local s = string.rep("a", 600)
+        \\  s:find(".-.-b")
+        \\  print("after")
+        \\end)
+    , &.{}, .{ .limits = .{ .memory_bytes = 2 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 }, .log = log.sink() });
+    try expectCallFails(ext, .stop, "{}", error.TimedOut, "time limit");
+    ext.deinit();
+    try waitForWorkers();
+    try std.testing.expectEqualStrings("test info before\n", log.lines.items);
+}
+
+test "setmetatable refuses __gc, because finalizers run with hooks off" {
+    const ext = try loadForTest(
+        \\agent.on("stop", function()
+        \\  local ok, err = pcall(setmetatable, {}, { __gc = function() while true do end end })
+        \\  local plain = setmetatable({}, { __index = function() return "x" end })
+        \\  return { continue = tostring(ok) .. "|" .. err .. "|" .. plain.anything }
+        \\end)
+    , &.{}, .{});
     defer ext.deinit();
-    try expectCallFails(ext, .stop, "{}", error.HookFailed, "pattern too complex");
-    try expectCallFails(ext, .post_turn_end, "{}", error.HookFailed, "pattern too complex");
+    try expectCall(ext, .stop, "{}",
+        \\{"continue":"false|setmetatable: fx extensions cannot use __gc finalizers|x"}
+    );
 }
 
 test "plain finds return the same positions as stock Lua" {
@@ -769,25 +1069,29 @@ test "string.rep of an empty result returns at once" {
     const ext = try loadForTest(
         \\agent.on("stop", function()
         \\  local a = string.rep("", math.maxinteger)
-        \\  local b = string.rep("", math.maxinteger, "")
-        \\  return { continue = "[" .. a .. "][" .. b .. "][" .. string.rep("ab", 3, ",") .. "]" }
+        \\  local b = ("").rep("", math.maxinteger, "")
+        \\  local c = string.rep("", 1e18)
+        \\  local ok, err = pcall(string.rep, "", {})
+        \\  return { continue = "[" .. a .. "][" .. b .. "][" .. c .. "][" .. string.rep("ab", 3, ",") .. "]" .. tostring(ok) }
         \\end)
     , &.{}, .{});
     defer ext.deinit();
     try expectCall(ext, .stop, "{}",
-        \\{"continue":"[][][ab,ab,ab]"}
+        \\{"continue":"[][][][ab,ab,ab]false"}
     );
 }
 
 test "table.move over a huge range fails instead of hanging" {
     const ext = try loadForTest(
         \\agent.on("stop", function() table.move({}, 1, math.maxinteger - 1, 2) end)
+        \\agent.on("pre_tool_use", function() table.move({}, math.mininteger, math.maxinteger, 2) end)
         \\agent.on("post_turn_end", function()
         \\  return { continue = table.concat(table.move({ "a", "b", "c" }, 1, 3, 2), ",") }
         \\end)
     , &.{}, .{});
     defer ext.deinit();
     try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to move");
+    try expectCallFails(ext, .pre_tool_use, "{}", error.HookFailed, "too many elements to move");
     try expectCall(ext, .post_turn_end, "{}",
         \\{"continue":"a,a,b,c"}
     );
@@ -801,15 +1105,20 @@ test "table.concat over a huge range of a proxy fails instead of hanging" {
         \\  local proxy = setmetatable({}, { __index = table.concat })
         \\  return { continue = table.concat(proxy, "", 1, math.maxinteger) }
         \\end)
+        \\agent.on("pre_tool_use", function()
+        \\  local proxy = setmetatable({}, { __index = table.concat, __len = function() return math.maxinteger end })
+        \\  return { continue = table.concat(proxy) }
+        \\end)
         \\agent.on("post_turn_end", function()
         \\  local proxy = setmetatable({}, { __index = table.concat })
-        \\  return { continue = "[" .. table.concat(proxy, "", 1, 3) .. "]" }
+        \\  return { continue = "[" .. table.concat(proxy, "", 1, 3) .. "][" .. table.concat({ 1, 2, 3 }, "-") .. "]" }
         \\end)
     , &.{}, .{});
     defer ext.deinit();
     try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to concatenate");
+    try expectCallFails(ext, .pre_tool_use, "{}", error.HookFailed, "too many elements to concatenate");
     try expectCall(ext, .post_turn_end, "{}",
-        \\{"continue":"[]"}
+        \\{"continue":"[][1-2-3]"}
     );
 }
 
@@ -821,15 +1130,18 @@ test "table.insert and table.remove under a huge __len fail instead of hanging" 
         \\agent.on("post_turn_end", function()
         \\  local t = { "a", "c" }
         \\  table.insert(t, 2, "b")
+        \\  table.insert(t, "d")
         \\  local removed = table.remove(t, 1)
-        \\  return { continue = removed .. ":" .. table.concat(t, ",") }
+        \\  local last = table.remove(t)
+        \\  local ok = pcall(table.insert, t, 1, 2, 3)
+        \\  return { continue = removed .. last .. ":" .. table.concat(t, ",") .. ":" .. tostring(ok) }
         \\end)
     , &.{}, .{});
     defer ext.deinit();
-    try expectCallFails(ext, .stop, "{}", error.HookFailed, "too many elements to move");
-    try expectCallFails(ext, .pre_tool_use, "{}", error.HookFailed, "too many elements to move");
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "table.insert: the table is too long");
+    try expectCallFails(ext, .pre_tool_use, "{}", error.HookFailed, "table.remove: the table is too long");
     try expectCall(ext, .post_turn_end, "{}",
-        \\{"continue":"a:b,c"}
+        \\{"continue":"ad:b,c:false"}
     );
 }
 
@@ -848,13 +1160,15 @@ test "table.sort under a huge __len fails instead of running for hours" {
         \\agent.on("post_turn_end", function()
         \\  local t = { 3, 1, 2 }
         \\  table.sort(t)
-        \\  return { continue = table.concat(t, ",") }
+        \\  local u = { 3, 1, 2 }
+        \\  table.sort(u, function(a, b) return a > b end)
+        \\  return { continue = table.concat(t, ",") .. ":" .. table.concat(u, ",") }
         \\end)
     , &.{}, .{});
     defer ext.deinit();
-    try expectCallFails(ext, .stop, "{}", error.HookFailed, "array too big");
+    try expectCallFails(ext, .stop, "{}", error.HookFailed, "table.sort: the table is too long");
     try expectCall(ext, .post_turn_end, "{}",
-        \\{"continue":"1,2,3"}
+        \\{"continue":"1,2,3:3,2,1"}
     );
 }
 

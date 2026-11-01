@@ -5,7 +5,8 @@
 # library, its own files, and the translated Lua header (lua_c), so it holds
 # no fx state and reads no files: the host hands it every file an extension
 # may load. Only src/core/lua_host adapts it to fx's hook runtime.
-# The vendored C source must leave out the libraries the sandbox never opens.
+# The build compiles stock Lua and must leave out the libraries the sandbox
+# never opens.
 
 set -euo pipefail
 
@@ -50,9 +51,19 @@ if [[ -n "$io_use" ]]; then
   exit 1
 fi
 
+sources="$(awk '/^const lua_sources = /,/^};/' build.zig)"
+if [[ -z "$sources" ]]; then
+  printf 'build.zig must list the Lua C files it compiles in lua_sources\n' >&2
+  exit 1
+fi
 for library in liolib.c loslib.c loadlib.c ldblib.c lcorolib.c linit.c lua.c luac.c; do
-  if [[ -e "$folder/vendor/$library" ]]; then
-    printf 'The sandbox never opens %s; remove %s/vendor/%s\n' "$library" "$folder" "$library" >&2
+  if grep -q "\"$library\"" <<<"$sources"; then
+    printf 'The sandbox never opens %s; remove it from lua_sources in build.zig\n' "$library" >&2
     exit 1
   fi
 done
+
+if [[ -e "$folder/vendor" ]]; then
+  printf 'fx builds Lua from the pinned build.zig.zon dependency; remove %s/vendor\n' "$folder" >&2
+  exit 1
+fi

@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
     const lua = addLua(b, target, optimize);
-    lua.embedIn(exe.root_module);
+    if (lua) |found| found.embedIn(exe.root_module);
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
     exe.root_module.addImport("fuzz_seed", fuzz_seed);
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     fuzz_root.addImport("build_options", build_options.createModule());
-    lua.embedIn(fuzz_root);
+    if (lua) |found| found.embedIn(fuzz_root);
     fuzz_root.addImport("fuzz_corpus", fuzz_corpus);
     fuzz_root.addImport("fuzz_seed", fuzz_seed);
     fuzz_root.addImport("session_manager", session_manager);
@@ -359,12 +359,16 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// The vendored Lua 5.4 sources behind extension hooks, built once as a
-/// static library, with their header as the `lua_c` import.
+/// Lua 5.4 behind extension hooks, built from the release tarball that
+/// `build.zig.zon` pins as the `lua` dependency, as a static library with
+/// its header as the `lua_c` import. fx builds stock Lua: the engine in
+/// `src/lua/` bounds what the C library can do instead of patching it.
 /// Only the native fx binary, its tests, and its fuzz targets embed Lua:
 /// libfx stays Lua-free. The `io`, `os`, `package`, `debug` and `coroutine`
-/// libraries are left out. A separate library keeps the C code out of the
-/// coverage instrumentation that `zig build fuzz --fuzz` adds to tests.
+/// libraries, `linit.c`, and the `lua`/`luac` programs are left out; see
+/// `scripts/check-lua-boundary.sh`. A separate library keeps the C code out
+/// of the coverage instrumentation that `zig build fuzz --fuzz` adds to
+/// tests.
 const Lua = struct {
     c_module: *std.Build.Module,
     library: *std.Build.Step.Compile,
@@ -375,17 +379,32 @@ const Lua = struct {
     }
 };
 
+/// The Lua C files fx compiles, from the release's `src` folder.
+const lua_sources = [_][]const u8{
+    "lapi.c",     "lcode.c",    "lctype.c",   "ldebug.c",  "ldo.c",
+    "ldump.c",    "lfunc.c",    "lgc.c",      "llex.c",    "lmem.c",
+    "lobject.c",  "lopcodes.c", "lparser.c",  "lstate.c",  "lstring.c",
+    "ltable.c",   "ltm.c",      "lundump.c",  "lvm.c",     "lzio.c",
+    "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c", "ltablib.c",
+    "lutf8lib.c",
+};
+
+/// Returns null while Zig fetches the `lua` dependency; the build then runs
+/// again with it.
 fn addLua(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
-) Lua {
+) ?Lua {
+    const dependency = b.lazyDependency("lua", .{}) orelse return null;
+    const source = dependency.path("src");
+
     const lua_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lua/vendor/fx_lua.h"),
+        .root_source_file = b.path("src/lua/fx_lua.h"),
         .target = target,
         .optimize = optimize,
     });
-    lua_c.addIncludePath(b.path("src/lua/vendor"));
+    lua_c.addIncludePath(source);
 
     const lua = b.addLibrary(.{
         .linkage = .static,
@@ -397,15 +416,8 @@ fn addLua(
         }),
     });
     lua.root_module.addCSourceFiles(.{
-        .root = b.path("src/lua/vendor"),
-        .files = &.{
-            "lapi.c",     "lcode.c",    "lctype.c",   "ldebug.c",  "ldo.c",
-            "ldump.c",    "lfunc.c",    "lgc.c",      "llex.c",    "lmem.c",
-            "lobject.c",  "lopcodes.c", "lparser.c",  "lstate.c",  "lstring.c",
-            "ltable.c",   "ltm.c",      "lundump.c",  "lvm.c",     "lzio.c",
-            "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c", "ltablib.c",
-            "lutf8lib.c",
-        },
+        .root = source,
+        .files = &lua_sources,
         // A Debug build asserts on C API misuse, such as pushing past the
         // stack space a C function was given, so tests catch it.
         .flags = if (optimize == .debug)

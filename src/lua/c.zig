@@ -1,4 +1,4 @@
-//! The Lua 5.4 C API, translated from `vendor/fx_lua.h`, plus Zig versions
+//! The Lua 5.4 C API, translated from `fx_lua.h`, plus Zig versions
 //! of the API macros that translation cannot keep.
 
 const std = @import("std");
@@ -70,9 +70,15 @@ pub const LUA_TFUNCTION = 6;
 pub const LUA_MASKCOUNT = 1 << 3;
 pub const LUA_NOREF = -2;
 
-/// `LUAI_MAXSTACK` in the vendored `luaconf.h`.
+/// `LUAI_MAXSTACK` in Lua's `luaconf.h`.
 const luai_maxstack = 1000000;
 pub const LUA_REGISTRYINDEX = -luai_maxstack - 1000;
+
+/// `lua_getextraspace`: the pointer-sized block Lua keeps in front of each
+/// state for its host (`LUA_EXTRASPACE` in `luaconf.h`).
+pub fn extraSpace(L: ?*State) *?*anyopaque {
+    return @ptrFromInt(@intFromPtr(L.?) - @sizeOf(*anyopaque));
+}
 
 pub fn upvalueIndex(i: c_int) c_int {
     return LUA_REGISTRYINDEX - i;

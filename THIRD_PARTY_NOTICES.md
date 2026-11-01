@@ -32,7 +32,8 @@ SOFTWARE.
 ## Lua
 
 The fx binary embeds Lua 5.4.8 from [lua.org](https://www.lua.org) to run
-extension hooks. Its source is vendored in `src/lua/vendor/`.
+extension hooks. The build downloads the unmodified release, which
+`build.zig.zon` pins by hash.
 
 MIT License
 

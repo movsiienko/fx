@@ -29,6 +29,8 @@ zig build
 ./zig-out/bin/fx
 ```
 
+The first build downloads Lua 5.4.8 from lua.org, which `build.zig.zon` pins by hash, and Zig keeps it in the `zig-pkg/` folder of your checkout. To build without network access, download `lua-5.4.8.tar.gz` some other way and run `zig fetch lua-5.4.8.tar.gz` once: Zig checks the file against the pinned hash and then uses it.
+
 Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change.
 
 fx keeps its settings and sessions in `~/.fx`, and on macOS it stores API keys and OAuth credentials in your Keychain. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:

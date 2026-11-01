@@ -107,6 +107,7 @@ pub const Catalog = struct {
                 entry.kv = manifest.kv;
                 entry.memory_mb = manifest.limits.memory_bytes / (1024 * 1024);
                 entry.instructions_per_call = manifest.limits.instructions_per_call;
+                entry.timeout_ms = manifest.limits.timeout_ms;
             }
         }
         const result: listing.Listing = .{

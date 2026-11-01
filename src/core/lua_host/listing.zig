@@ -31,6 +31,7 @@ pub const Entry = struct {
     kv: bool = false,
     memory_mb: usize = 0,
     instructions_per_call: u32 = 0,
+    timeout_ms: u32 = 0,
     file_count: usize = 0,
     sha256: []const u8 = "",
     /// Files added, changed, or removed since the extension was trusted.

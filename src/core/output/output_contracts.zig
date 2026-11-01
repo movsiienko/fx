@@ -486,9 +486,10 @@ pub const ExtensionsSnapshot = struct {
                 try writeJoined(w, entry.events);
                 try w.writeAll(" scopes=");
                 try writeJoined(w, entry.scopes);
-                try w.print(" memory_mb={d} instructions_per_call={d} kv={} files={d}", .{
+                try w.print(" memory_mb={d} instructions_per_call={d} timeout_ms={d} kv={} files={d}", .{
                     entry.memory_mb,
                     entry.instructions_per_call,
+                    entry.timeout_ms,
                     entry.kv,
                     entry.file_count,
                 });
@@ -558,6 +559,7 @@ pub const ExtensionsSnapshot = struct {
             kv: bool,
             memory_mb: usize,
             instructions_per_call: u32,
+            timeout_ms: u32,
             files: usize,
             sha256: []const u8,
             changed_files: []const []const u8,
@@ -578,6 +580,7 @@ pub const ExtensionsSnapshot = struct {
                 .kv = entry.kv,
                 .memory_mb = entry.memory_mb,
                 .instructions_per_call = entry.instructions_per_call,
+                .timeout_ms = entry.timeout_ms,
                 .files = entry.file_count,
                 .sha256 = entry.sha256,
                 .changed_files = entry.changed_files,
@@ -614,6 +617,7 @@ test "extensions snapshot renders text and JSON from one listing" {
                 .scopes = &.{ "interactive", "ask" },
                 .memory_mb = 4,
                 .instructions_per_call = 5000000,
+                .timeout_ms = 1000,
                 .file_count = 2,
                 .sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             },
@@ -637,10 +641,10 @@ test "extensions snapshot renders text and JSON from one listing" {
         \\[extensions] directory=/Users/example/.fx/extensions
         \\[extensions] trusted policy; this takes effect the next time fx starts
         \\[extensions] extensions:
-        \\ - policy 0.1.0 state=trusted hooks=pre_tool_use scopes=interactive,ask memory_mb=4 instructions_per_call=5000000 kv=false files=2 sha256=0123456789ab
+        \\ - policy 0.1.0 state=trusted hooks=pre_tool_use scopes=interactive,ask memory_mb=4 instructions_per_call=5000000 timeout_ms=1000 kv=false files=2 sha256=0123456789ab
         \\ - broken state=invalid
         \\   problem: manifest.lua is missing
-        \\ - fresh state=needs_review hooks=stop scopes=ask memory_mb=0 instructions_per_call=0 kv=false files=0 sha256=fedcba987654
+        \\ - fresh state=needs_review hooks=stop scopes=ask memory_mb=0 instructions_per_call=0 timeout_ms=0 kv=false files=0 sha256=fedcba987654
         \\   changed since trusted: main.lua
         \\   review its files in /Users/example/.fx/extensions/fresh, then run: fx extensions trust fresh fedcba987654
         \\
@@ -659,6 +663,7 @@ test "extensions snapshot renders text and JSON from one listing" {
     try std.testing.expectEqualStrings("trusted", first.get("state").?.string);
     try std.testing.expect(first.get("runs").?.bool);
     try std.testing.expectEqual(@as(i64, 5000000), first.get("instructions_per_call").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), first.get("timeout_ms").?.integer);
 }
 
 test "extensions snapshot text escapes control bytes in folder names" {
