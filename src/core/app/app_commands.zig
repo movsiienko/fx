@@ -20,6 +20,7 @@ const settings_catalog = @import("../config/settings_catalog.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
+const lua_host = @import("../lua_host/lua_host.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
@@ -317,6 +318,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
+                .handle_extensions = commandHandleExtensions,
                 .unknown = commandUnknown,
             };
         }
@@ -1360,6 +1362,11 @@ pub fn Handlers(comptime App: type) type {
             try handleWorkspaceCommand(app, rest);
         }
 
+        fn commandHandleExtensions(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleExtensionsCommand(app, rest);
+        }
+
         fn commandShowVersion(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(.{
@@ -1378,6 +1385,32 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
     };
+}
+
+const extensions_usage = "Usage: /extensions [list|trust NAME [SHA256]|disable NAME|enable NAME]";
+
+fn handleExtensionsCommand(app: anytype, rest: []const u8) !void {
+    var words: [3][]const u8 = undefined;
+    var word_count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, rest, " \t");
+    while (tokens.next()) |token| {
+        if (word_count == words.len) return writeExtensionsError(app, extensions_usage);
+        words[word_count] = token;
+        word_count += 1;
+    }
+    const action = lua_host.parseAction(words[0..word_count]) catch
+        return writeExtensionsError(app, extensions_usage);
+    var listing = lua_host.execute(app.alloc, action, null) catch |err|
+        return writeExtensionsError(app, lua_host.errorMessage(err) orelse extensions_usage);
+    defer listing.deinit();
+    const snapshot: output_contracts.ExtensionsSnapshot = .{ .listing = &listing };
+    const body = try snapshot.renderInteractiveBody(app.alloc);
+    defer app.alloc.free(body);
+    try app.writeDomainNotice(.{ .topic = "extensions", .tone = .neutral, .body = body }, true);
+}
+
+fn writeExtensionsError(app: anytype, message: []const u8) !void {
+    try app.writeDomainNotice(.{ .topic = "extensions", .tone = .@"error", .body = message }, true);
 }
 
 const trace_transcript_max_line_bytes: usize = 300;

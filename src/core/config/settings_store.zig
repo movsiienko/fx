@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const extension_listing = @import("../lua_host/listing.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -90,6 +91,28 @@ pub const WorkspaceDirectoryMutation = struct {
 pub const ProjectMcpMutation = struct {
     workspace_root: []const u8,
     action: project_config.ProjectMcpAction,
+};
+
+/// The profile key that holds Lua extension trust records. Only
+/// `~/.fx/settings.json` sets it; project `.fx.json` never parses it.
+pub const extensions_key = "extensions";
+pub const max_extension_files = 64;
+
+pub const ExtensionFileHash = struct {
+    path: []const u8,
+    sha256: []const u8,
+};
+
+pub const ExtensionMutation = struct {
+    name: []const u8,
+    action: union(enum) {
+        /// Records the reviewed contents and turns the extension on.
+        trust: struct {
+            sha256: []const u8,
+            files: []const ExtensionFileHash,
+        },
+        set_disabled: bool,
+    },
 };
 
 pub const UserSettingsPatch = struct {
@@ -273,6 +296,7 @@ const SettingsMutation = union(enum) {
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
     project_mcp: ProjectMcpMutation,
+    extension: ExtensionMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
@@ -280,6 +304,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
             .project_mcp => "project_mcp_patch",
+            .extension => "extension_patch",
         };
     }
 
@@ -292,6 +317,7 @@ const SettingsMutation = union(enum) {
                 .local => .local,
             },
             .project_mcp => .local,
+            .extension => .user,
         };
     }
 
@@ -304,6 +330,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "commit_first",
             .permission => "commit_first",
             .project_mcp => "commit_first",
+            .extension => "commit_first",
         };
     }
 
@@ -313,6 +340,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => false,
             .permission => false,
             .project_mcp => false,
+            .extension => false,
         };
     }
 };
@@ -449,6 +477,14 @@ pub const Store = struct {
         mutation: ProjectMcpMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
+    pub fn applyExtensionMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: ExtensionMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .extension = mutation });
     }
 
     fn applyMutation(
@@ -888,7 +924,34 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
+        .extension => |extension| {
+            if (!extension_listing.validName(extension.name)) return error.InvalidDurableField;
+            switch (extension.action) {
+                .trust => |trust| {
+                    if (!validSha256Hex(trust.sha256) or trust.files.len > max_extension_files) {
+                        return error.InvalidDurableField;
+                    }
+                    for (trust.files) |file| {
+                        if (file.path.len == 0 or file.path.len > 256 or
+                            !std.unicode.utf8ValidateSlice(file.path) or
+                            !validSha256Hex(file.sha256))
+                        {
+                            return error.InvalidDurableField;
+                        }
+                    }
+                },
+                .set_disabled => {},
+            }
+        },
     }
+}
+
+fn validSha256Hex(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
 }
 
 pub fn validateModel(model: []const u8) !void {
@@ -1035,6 +1098,7 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
         .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
+        .extension => |extension| applyExtensionMutationToRoot(arena, root, extension),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -1568,6 +1632,83 @@ fn applyProjectMcpMutationToRoot(
     };
 }
 
+fn applyExtensionMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: ExtensionMutation,
+) !PatchApplication {
+    const extensions = try childObject(arena, &root.object, extensions_key);
+    const record = try childObject(arena, extensions, mutation.name);
+    var changed = false;
+    switch (mutation.action) {
+        .trust => |trust| {
+            changed = try putString(arena, record, "sha256", trust.sha256) or changed;
+            var files: std.json.ObjectMap = .empty;
+            for (trust.files) |file| {
+                try files.put(arena, try arena.dupe(u8, file.path), .{ .string = try arena.dupe(u8, file.sha256) });
+            }
+            if (!sameStringMap(record.get("files"), files)) {
+                try record.put(arena, "files", .{ .object = files });
+                changed = true;
+            }
+            changed = record.orderedRemove("disabled") or changed;
+        },
+        .set_disabled => |disabled| {
+            if (disabled) {
+                changed = try putBool(arena, record, "disabled", true) or changed;
+            } else {
+                changed = record.orderedRemove("disabled") or changed;
+            }
+        },
+    }
+    return .{ .changed = changed, .authority_reduced = mutation.action == .set_disabled and mutation.action.set_disabled };
+}
+
+fn childObject(arena: Allocator, parent: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    const entry = try parent.getOrPut(arena, key);
+    if (!entry.found_existing) {
+        entry.key_ptr.* = try arena.dupe(u8, key);
+        entry.value_ptr.* = .{ .object = .empty };
+    }
+    if (entry.value_ptr.* != .object) return error.InvalidSettingsFormat;
+    return &entry.value_ptr.object;
+}
+
+fn sameStringMap(existing: ?std.json.Value, wanted: std.json.ObjectMap) bool {
+    const value = existing orelse return false;
+    if (value != .object or value.object.count() != wanted.count()) return false;
+    var it = wanted.iterator();
+    while (it.next()) |entry| {
+        const other = value.object.get(entry.key_ptr.*) orelse return false;
+        if (other != .string or !std.mem.eql(u8, other.string, entry.value_ptr.string)) return false;
+    }
+    return true;
+}
+
+/// Checks the shape of the `extensions` trust records.
+fn validateExtensionsSetting(object: std.json.ObjectMap) !void {
+    const extensions = object.get(extensions_key) orelse return;
+    if (extensions != .object) return error.InvalidSettingsFormat;
+    var it = extensions.object.iterator();
+    while (it.next()) |entry| {
+        if (!extension_listing.validName(entry.key_ptr.*) or entry.value_ptr.* != .object) return error.InvalidSettingsFormat;
+        const record = entry.value_ptr.object;
+        if (record.get("sha256")) |digest| {
+            if (digest != .string or !validSha256Hex(digest.string)) return error.InvalidSettingsFormat;
+        }
+        if (record.get("disabled")) |disabled| {
+            if (disabled != .bool) return error.InvalidSettingsFormat;
+        }
+        if (record.get("files")) |files| {
+            if (files != .object or files.object.count() > max_extension_files) return error.InvalidSettingsFormat;
+            var file_it = files.object.iterator();
+            while (file_it.next()) |file| {
+                if (file.value_ptr.* != .string or !validSha256Hex(file.value_ptr.string)) return error.InvalidSettingsFormat;
+            }
+        }
+    }
+}
+
 fn workspaceObject(
     arena: Allocator,
     root: *std.json.Value,
@@ -1859,6 +2000,7 @@ fn validateCandidate(
     try validateKnownSettingsObject(parsed.value.object, false);
     const workspace_root = switch (mutation) {
         .user => return,
+        .extension => return validateExtensionsSetting(parsed.value.object),
         .workspace_directory => |workspace| workspace.workspace_root,
         .permission => |permission| switch (permission.scope) {
             .user => return,
@@ -4163,4 +4305,25 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "extension mutation rejects stored records whose names extensions cannot have" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "Policy", "-x", "_x" }) |stored_name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        const fixture = try alloc.print("{{\"extensions\":{{\"{s}\":{{\"disabled\":true}}}}}}\n", .{stored_name});
+        defer alloc.free(fixture);
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        var store = try Store.initFromHome(alloc, home, .writable);
+        defer store.deinit(alloc);
+
+        try std.testing.expectError(
+            error.InvalidSettingsFormat,
+            store.applyExtensionMutation(alloc, .{ .name = "policy", .action = .{ .set_disabled = true } }),
+        );
+    }
 }

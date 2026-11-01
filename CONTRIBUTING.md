@@ -29,6 +29,8 @@ zig build
 ./zig-out/bin/fx
 ```
 
+The first build downloads Lua 5.4.8 from lua.org, which `build.zig.zon` pins by hash, and Zig keeps it in the `zig-pkg/` folder of your checkout. To build without network access, download `lua-5.4.8.tar.gz` some other way and run `zig fetch lua-5.4.8.tar.gz` once: Zig checks the file against the pinned hash and then uses it.
+
 Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change.
 
 fx keeps its settings and sessions in `~/.fx`, and on macOS it stores API keys and OAuth credentials in your Keychain. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
@@ -201,7 +203,7 @@ These five checks must pass before a pull request merges:
 
 | Check | What it runs |
 | --- | --- |
-| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
+| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, indexer-boundary, and Lua-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
 | `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
 | `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |

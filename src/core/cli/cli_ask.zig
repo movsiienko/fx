@@ -31,6 +31,7 @@ const http_pool = @import("../shared/http_pool.zig");
 const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
+const lua_host = @import("../lua_host/lua_host.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const select_watch = @import("../shared/select_watch.zig");
@@ -645,6 +646,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    lua_hooks: lua_host.Hooks = .{},
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -697,6 +699,13 @@ const AskContext = struct {
                 .ctx = self,
                 .run = attentionRequiredNotification,
             });
+        }
+        const lua_summary = try self.lua_hooks.register(self.alloc, &self.lifecycle_runtime, .{});
+        if (try lua_host.noticeText(self.alloc, lua_summary, "fx extensions list")) |notice| {
+            defer self.alloc.free(notice);
+            try self.writeStderr("fx ask: ");
+            try self.writeStderr(notice);
+            try self.writeStderr("\n");
         }
         self.lifecycle_view = self.lifecycle_runtime.freeze();
     }
@@ -773,6 +782,7 @@ const AskContext = struct {
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        self.lua_hooks.deinit();
         if (self.v2) |v2| v2.close();
         self.v2 = null;
         if (self.v2_store) |*store| store.deinit(self.alloc);
@@ -6335,6 +6345,15 @@ test "fx ask bell writes only to TTY stderr" {
 }
 
 test "fx ask registers notification handlers only when configured" {
+    // `fx ask` reads its profile, Lua extensions included, from HOME. An
+    // empty one keeps the test off any profile on this machine.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const test_home = try TestAskHome.install(std.testing.allocator, home);
+    defer test_home.deinit();
+
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(std.testing.allocator);
     var stderr_capture: TestCapture = .{};
@@ -6361,6 +6380,10 @@ test "fx ask registers notification handlers only when configured" {
 
     try std.testing.expect(enabled.lifecycle_view.hasPostTurnEnd());
     try std.testing.expect(enabled.lifecycle_view.hasAttentionRequired());
+    const view = enabled.lifecycle_view;
+    inline for (.{ view.pre_tool_use_handlers, view.stop_handlers, view.post_turn_end_handlers, view.attention_required_handlers }) |handlers| {
+        for (handlers) |handler| try std.testing.expect(!std.mem.startsWith(u8, handler.hook.name, "lua."));
+    }
 }
 
 test "fx ask captured and quiet permission paths bypass terminal prompt" {

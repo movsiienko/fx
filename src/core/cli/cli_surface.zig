@@ -52,6 +52,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const lua_host = @import("../lua_host/lua_host.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("../app/usage_host.zig");
 
@@ -86,6 +87,7 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    extensions: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -575,6 +577,9 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
+        },
+        'e' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .extensions)) return .{ .extensions = args[1..] };
         },
         'i' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .issue)) return .{ .issue = args[1..] };
@@ -1653,6 +1658,22 @@ fn runNonInteractiveWithDeps(
                 },
             }
         },
+        .extensions => |rest| {
+            const opts = parseExtensionsArgs(rest) catch |err| {
+                try writeExtensionsCommandError(alloc, cfg.command_catalog, deps, rest, err);
+                return .handled_failure;
+            };
+            var listing = lua_host.execute(alloc, opts.action, null) catch |err| {
+                try writeExtensionsCommandError(alloc, cfg.command_catalog, deps, rest, err);
+                return .handled_failure;
+            };
+            defer listing.deinit();
+            const snapshot: output_contracts.ExtensionsSnapshot = .{ .listing = &listing };
+            const text = try snapshot.render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
         .credits => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
@@ -2469,6 +2490,35 @@ fn writeWorkspaceCommandError(
     defer out.deinit();
     try out.writer.writeAll("{\"kind\":\"workspace\",\"error\":");
     try std.json.Stringify.value(message, .{}, &out.writer);
+    try out.writer.writeAll(",\"code\":");
+    try std.json.Stringify.value(@errorName(err), .{}, &out.writer);
+    try out.writer.writeByte('}');
+    try writeJsonLine(deps, out.writer.buffered());
+}
+
+fn writeExtensionsCommandError(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    args: []const [:0]const u8,
+    err: anyerror,
+) !void {
+    const message = lua_host.errorMessage(err);
+    if (!argsContainJson(args)) {
+        if (message) |text| {
+            try writeStderr(deps, "fx extensions: ");
+            try writeStderr(deps, text);
+            try writeStderr(deps, "\n");
+            return;
+        }
+        try writeTopLevelUsage(command_catalog, deps, .extensions);
+        return;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"extensions\",\"error\":");
+    try std.json.Stringify.value(message orelse "invalid arguments", .{}, &out.writer);
     try out.writer.writeAll(",\"code\":");
     try std.json.Stringify.value(@errorName(err), .{}, &out.writer);
     try out.writer.writeByte('}');
@@ -3397,6 +3447,29 @@ fn formatSessionListCursor(
         "v1:{d}:{s}",
         .{ summary.updated_at_ms, summary.id },
     );
+}
+
+const ExtensionsOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    action: lua_host.Action = .list,
+};
+
+fn parseExtensionsArgs(args: []const [:0]const u8) !ExtensionsOptions {
+    var words: [3][]const u8 = undefined;
+    var word_count: usize = 0;
+    var options = ExtensionsOptions{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (options.format == .json) return error.InvalidExtensionsArgs;
+            options.format = .json;
+            continue;
+        }
+        if (word_count >= words.len) return error.InvalidExtensionsArgs;
+        words[word_count] = arg;
+        word_count += 1;
+    }
+    options.action = try lua_host.parseAction(words[0..word_count]);
+    return options;
 }
 
 fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {

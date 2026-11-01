@@ -43,6 +43,7 @@ pub const ParsedCommand = union(enum) {
     workspace: []const u8,
     shell: []const u8,
     version,
+    extensions: []const u8,
     unknown,
 };
 
@@ -86,6 +87,7 @@ pub const CommandHandlers = struct {
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_extensions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -133,6 +135,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
         .version => .version,
+        .extensions => .{ .extensions = payload },
     };
 }
 
@@ -189,6 +192,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .extensions => |rest| try handlers.handle_extensions(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -526,6 +530,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_workspace = unexpectedPayload,
         .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .handle_extensions = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
 }

@@ -83,6 +83,7 @@ const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
+const lua_host = @import("core/lua_host/lua_host.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
@@ -410,6 +411,7 @@ const App = struct {
         builtin_hooks.notifications.provider(Self),
     );
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LuaHookAppRuntime = lua_host.AppRuntime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -545,6 +547,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    lua_hooks: lua_host.Hooks = .{},
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
@@ -738,9 +741,10 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register herdr and Lua hooks before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try LuaHookAppRuntime.configure(self);
         try NotificationAppRuntime.configure(self);
     }
 
@@ -899,6 +903,11 @@ const App = struct {
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
+        // Lua states are left for process exit like other memory, but the
+        // failures their hooks held back are durable state. The worker has
+        // stopped, so its turns count no more of them.
+        self.lua_hooks.flushFailures();
+        shutdown_trace.mark("lua_failures_recorded");
 
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
@@ -990,6 +999,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        self.lua_hooks.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3771,13 +3781,30 @@ test "footer runtime compatibility facade exports composeFooterFrame" {
 }
 
 test "interactive app keeps notification handlers registered for live preference changes" {
+    // The app reads its profile, Lua extensions included, from HOME. An
+    // empty one keeps the test off any profile on this machine.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
     var app = App{ .alloc = std.testing.allocator };
     defer app.lifecycle_runtime.deinit();
+    defer app.lua_hooks.deinit();
 
     try app.configureNotifications();
 
     try std.testing.expect(app.lifecycle_view.hasPostTurnEnd());
     try std.testing.expect(app.lifecycle_view.hasAttentionRequired());
+    const view = app.lifecycle_view;
+    inline for (.{ view.pre_tool_use_handlers, view.stop_handlers, view.post_turn_end_handlers, view.attention_required_handlers }) |handlers| {
+        for (handlers) |handler| try std.testing.expect(!std.mem.startsWith(u8, handler.hook.name, "lua."));
+    }
 
     app.setNotificationPreferences(true, true, true);
     const preferences = app.notificationPreferences();
@@ -4658,6 +4685,15 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
+}
+
+// A named test, unlike `test {}`, is analyzed only when the test filter
+// selects it. The ANSI span test in assistant_stream.zig compiles this file
+// again with plain `zig test`, which has no build_options or lua_c module,
+// so the Lua host must stay out of the block below.
+test "lua extension hooks" {
+    _ = @import("core/lua_host/lua_host.zig");
+    _ = @import("lua/engine.zig");
 }
 
 test {

@@ -380,6 +380,14 @@ pub fn encodeTerminalSafe(
     };
 }
 
+/// Writes all of `raw` to `writer` as `encodeTerminalSafe` encodes it,
+/// with no length limit. `alloc` holds the encoded copy until it is written.
+pub fn writeTerminalSafe(writer: *std.Io.Writer, alloc: std.mem.Allocator, raw: []const u8) !void {
+    var encoded = try encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+    defer encoded.deinit(alloc);
+    try writer.writeAll(encoded.bytes);
+}
+
 /// Like `encodeTerminalSafe`, but first flattens every run of ASCII
 /// whitespace (including line breaks and tabs) into a single space and trims
 /// the ends, so multi-line human-readable text stays readable inside a

@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
     build_options.addOption(bool, "builtin_tools", true);
+    // Whether this build embeds Lua for extension hooks (see addLua).
+    build_options.addOption(bool, "lua_hooks", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -87,6 +89,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    const lua = addLua(b, target, optimize);
+    if (lua) |found| found.embedIn(exe.root_module);
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
     exe.root_module.addImport("fuzz_seed", fuzz_seed);
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
@@ -101,8 +105,14 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run only the fx unit tests whose names contain this text; repeatable",
+    ) orelse &.{};
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
@@ -146,6 +156,9 @@ pub fn build(b: *std.Build) void {
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
     session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
+    const test_fx_step = b.step("test-fx", "Run fx's own unit tests; -Dtest-filter narrows them");
+    test_fx_step.dependOn(&run_exe_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
@@ -168,6 +181,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     fuzz_root.addImport("build_options", build_options.createModule());
+    if (lua) |found| found.embedIn(fuzz_root);
     fuzz_root.addImport("fuzz_corpus", fuzz_corpus);
     fuzz_root.addImport("fuzz_seed", fuzz_seed);
     fuzz_root.addImport("session_manager", session_manager);
@@ -345,6 +359,75 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// Lua 5.4 behind extension hooks, built from the release tarball that
+/// `build.zig.zon` pins as the `lua` dependency, as a static library with
+/// its header as the `lua_c` import. fx builds stock Lua: the engine in
+/// `src/lua/` bounds what the C library can do instead of patching it.
+/// Only the native fx binary, its tests, and its fuzz targets embed Lua:
+/// libfx stays Lua-free. The `io`, `os`, `package`, `debug` and `coroutine`
+/// libraries, `linit.c`, and the `lua`/`luac` programs are left out; see
+/// `scripts/check-lua-boundary.sh`. A separate library keeps the C code out
+/// of the coverage instrumentation that `zig build fuzz --fuzz` adds to
+/// tests.
+const Lua = struct {
+    c_module: *std.Build.Module,
+    library: *std.Build.Step.Compile,
+
+    fn embedIn(self: Lua, module: *std.Build.Module) void {
+        module.addImport("lua_c", self.c_module);
+        module.linkLibrary(self.library);
+    }
+};
+
+/// The Lua C files fx compiles, from the release's `src` folder.
+const lua_sources = [_][]const u8{
+    "lapi.c",     "lcode.c",    "lctype.c",   "ldebug.c",  "ldo.c",
+    "ldump.c",    "lfunc.c",    "lgc.c",      "llex.c",    "lmem.c",
+    "lobject.c",  "lopcodes.c", "lparser.c",  "lstate.c",  "lstring.c",
+    "ltable.c",   "ltm.c",      "lundump.c",  "lvm.c",     "lzio.c",
+    "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c", "ltablib.c",
+    "lutf8lib.c",
+};
+
+/// Returns null while Zig fetches the `lua` dependency; the build then runs
+/// again with it.
+fn addLua(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) ?Lua {
+    const dependency = b.lazyDependency("lua", .{}) orelse return null;
+    const source = dependency.path("src");
+
+    const lua_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lua/fx_lua.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_c.addIncludePath(source);
+
+    const lua = b.addLibrary(.{
+        .linkage = .static,
+        .name = "fx-lua",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lua.root_module.addCSourceFiles(.{
+        .root = source,
+        .files = &lua_sources,
+        // A Debug build asserts on C API misuse, such as pushing past the
+        // stack space a C function was given, so tests catch it.
+        .flags = if (optimize == .debug)
+            &.{ "-std=gnu99", "-DLUA_USE_APICHECK" }
+        else
+            &.{ "-std=gnu99", "-Os" },
+    });
+    return .{ .c_module = lua_c.createModule(), .library = lua };
+}
+
 fn addWasmArtifact(
     b: *std.Build,
     surface: WasmSurface,
@@ -374,6 +457,7 @@ fn addWasmArtifact(
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
     wasm_options.addOption(bool, "builtin_tools", true);
+    wasm_options.addOption(bool, "lua_hooks", false);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -422,6 +506,7 @@ fn addNapiArtifact(
     napi_options.addOption(bool, "libfx", true);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
+    napi_options.addOption(bool, "lua_hooks", false);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",
