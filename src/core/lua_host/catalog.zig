@@ -471,18 +471,10 @@ pub fn recordFailures(gpa: Allocator, home: []const u8, name: []const u8, sha256
     defer arena.deinit();
     const a = arena.allocator();
     const fx_root = try profile_paths.rootDir(a, home);
-    const io = io_mod.getIo();
     const directory = try std.Io.Dir.path.join(a, &.{ fx_root, failures_dir_name });
-    try std.Io.Dir.cwd().createDirPath(io, directory);
-    // Readable, not path-only, so creating the lock file can sync it.
-    var records: io_mod.VerifiedDir = .{ .dir = try std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true, .follow_symlinks = false }) };
-    defer records.close();
-    // A file system without locks still gets a record, unserialized.
-    var lock: ?io_mod.TimedAdvisoryLock = io_mod.acquireTimedAdvisoryLock(&records, failures_lock_file, failure_lock_wait_ms) catch |err| switch (err) {
-        error.LockUnsupported => null,
-        else => return err,
-    };
-    defer if (lock) |*held| held.release();
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), directory);
+    var records = try RecordsLock.acquire(directory);
+    defer records.release();
 
     var previous: Extension = .{ .name = name, .sha256 = sha256 };
     readFailures(a, fx_root, &previous) catch {};
@@ -496,15 +488,51 @@ pub fn recordFailures(gpa: Allocator, home: []const u8, name: []const u8, sha256
     try io_mod.writeFileAtomic(a, try failurePath(a, fx_root, name), out.written());
 }
 
-/// Forgets the failures of an extension, as trusting it again does.
-pub fn clearFailures(gpa: Allocator, home: []const u8, name: []const u8) void {
+/// Forgets the failures of an extension, as trusting it again does. Takes
+/// the same lock as `recordFailures`, so a failure write in flight cannot
+/// bring back what this cleared, and returns `error.LockBusy` without
+/// clearing when another process holds it too long.
+pub fn clearFailures(gpa: Allocator, home: []const u8, name: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const fx_root = profile_paths.rootDir(a, home) catch return;
-    const path = failurePath(a, fx_root, name) catch return;
-    std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
+    const fx_root = try profile_paths.rootDir(a, home);
+    const directory = try std.Io.Dir.path.join(a, &.{ fx_root, failures_dir_name });
+    var records = RecordsLock.acquire(directory) catch |err| switch (err) {
+        // No failure was ever recorded.
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer records.release();
+    std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), try failurePath(a, fx_root, name)) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
+
+/// The lock processes take turns on to update the failure records.
+const RecordsLock = struct {
+    dir: io_mod.VerifiedDir,
+    /// Null on a file system without locks, where updates go unserialized
+    /// rather than not at all.
+    lock: ?io_mod.TimedAdvisoryLock,
+
+    fn acquire(directory: []const u8) !RecordsLock {
+        // Readable, not path-only, so creating the lock file can sync it.
+        var dir: io_mod.VerifiedDir = .{ .dir = try std.Io.Dir.cwd().openDir(io_mod.getIo(), directory, .{ .iterate = true, .follow_symlinks = false }) };
+        errdefer dir.close();
+        const lock = io_mod.acquireTimedAdvisoryLock(&dir, failures_lock_file, failure_lock_wait_ms) catch |err| switch (err) {
+            error.LockUnsupported => null,
+            else => return err,
+        };
+        return .{ .dir = dir, .lock = lock };
+    }
+
+    fn release(self: *RecordsLock) void {
+        if (self.lock) |*held| held.release();
+        self.dir.close();
+    }
+};
 
 const TestHome = struct {
     tmp: std.testing.TmpDir,
@@ -660,7 +688,7 @@ test "failure records count only for the contents they were written for" {
     try std.testing.expectEqualStrings("boom again", entry.last_error.?);
     catalog.deinit();
 
-    clearFailures(std.testing.allocator, home.home, "policy");
+    try clearFailures(std.testing.allocator, home.home, "policy");
     catalog = try Catalog.load(std.testing.allocator, home.home);
     defer catalog.deinit();
     entry = catalog.find("policy").?;
@@ -706,6 +734,89 @@ test "failures recorded by processes at the same time all stay counted" {
     catalog = try Catalog.load(std.testing.allocator, home.home);
     defer catalog.deinit();
     try std.testing.expectEqual(@as(u64, 200), catalog.find("policy").?.failures);
+}
+
+test "failures counted before a clear never come back" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    try home.write("policy/manifest.lua", policy_manifest);
+    try home.write("policy/main.lua", "");
+    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    const digest = try std.testing.allocator.dupe(u8, catalog.find("policy").?.sha256);
+    defer std.testing.allocator.free(digest);
+    catalog.deinit();
+    const settings = try std.testing.allocator.print(
+        \\{{"extensions":{{"policy":{{"sha256":"{s}"}}}}}}
+    , .{digest});
+    defer std.testing.allocator.free(settings);
+    try home.writeSettings(settings);
+
+    // Threads record one failure per call, each opening the record on its
+    // own as a separate fx process would, while trust clears it.
+    const Writers = struct {
+        home: []const u8,
+        sha256: []const u8,
+        stop: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(u64) = .init(0),
+        failed: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                recordFailures(std.testing.allocator, self.home, "policy", self.sha256, 1, "boom") catch |err| {
+                    if (err != error.LockBusy) _ = self.failed.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                _ = self.calls.fetchAdd(1, .monotonic);
+                // A hook writes at most once a second, so the lock is
+                // free between writes.
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+        }
+
+        fn waitForCalls(self: *@This(), count: u64) void {
+            while (self.calls.load(.monotonic) < count) io_mod.sleep(std.time.ns_per_ms);
+        }
+    };
+    // A clear lands in the middle of a write only some of the time, so
+    // each round gives it another chance.
+    for (0..50) |_| {
+        // Far more failures than the threads record, so any that come back
+        // after the clear show.
+        try recordFailures(std.testing.allocator, home.home, "policy", digest, 1_000_000, "before");
+        var writers: Writers = .{ .home = home.home, .sha256 = digest };
+        {
+            var threads: [4]std.Thread = undefined;
+            var spawned: usize = 0;
+            defer {
+                writers.stop.store(true, .release);
+                for (threads[0..spawned]) |thread| thread.join();
+            }
+            while (spawned < threads.len) : (spawned += 1) {
+                threads[spawned] = try std.Thread.spawn(.{}, Writers.run, .{&writers});
+            }
+            writers.waitForCalls(8);
+            // Like a user running trust again when the record stays busy.
+            while (true) {
+                clearFailures(std.testing.allocator, home.home, "policy") catch |err| {
+                    if (err == error.LockBusy) continue;
+                    return err;
+                };
+                break;
+            }
+            writers.waitForCalls(writers.calls.load(.monotonic) + 8);
+        }
+
+        try std.testing.expectEqual(@as(usize, 0), writers.failed.load(.monotonic));
+        catalog = try Catalog.load(std.testing.allocator, home.home);
+        defer catalog.deinit();
+        // Only failures the threads recorded can remain.
+        const remaining = catalog.find("policy").?.failures;
+        const recorded = writers.calls.load(.monotonic);
+        if (remaining > recorded) {
+            std.debug.print("{d} failures remain after the clear, but the threads recorded {d}\n", .{ remaining, recorded });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "a folder that cannot be opened makes only its extension invalid" {

@@ -140,6 +140,7 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.HomeNotSet => "HOME is not set",
         error.SettingsCommitIndeterminate => "settings durability is uncertain; run fx extensions list to check the result",
         error.SettingsLockBusy => "another fx process is updating settings; try again",
+        error.FailuresNotCleared => "the extension is trusted, but its failure record could not be cleared, as another fx process may be writing it; run fx extensions trust again",
         error.InvalidSettingsFormat => "~/.fx/settings.json is not valid",
         else => "extensions update failed",
     };

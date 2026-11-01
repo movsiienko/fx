@@ -201,7 +201,10 @@ fn apply(gpa: Allocator, home: []const u8, catalog: *catalog_mod.Catalog, action
     defer store.deinit(gpa);
     var outcome = try store.applyExtensionMutation(gpa, mutation);
     outcome.deinit(gpa);
-    if (action == .trust) catalog_mod.clearFailures(gpa, home, name);
+    if (action == .trust) catalog_mod.clearFailures(gpa, home, name) catch |err| {
+        debug_trace.logf("lua_hooks", "event=clear_failures_failed extension={s} error={s}", .{ name, @errorName(err) });
+        return error.FailuresNotCleared;
+    };
 }
 
 const TestHome = struct {
