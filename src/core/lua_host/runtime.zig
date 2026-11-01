@@ -62,7 +62,7 @@ pub const Hooks = struct {
         std.debug.assert(self.arena == null);
         self.gpa = gpa;
         const home = options.home orelse io_mod.homeDir() orelse return .{};
-        var catalog = catalog_mod.Catalog.load(gpa, home) catch |err| {
+        var catalog = catalog_mod.Catalog.load(gpa, home, .session) catch |err| {
             debug_trace.logf("lua_hooks", "event=discovery_failed error={s}", .{@errorName(err)});
             // Nothing runs, so say so: a policy extension that silently stops
             // enforcing is worse than a notice.
@@ -168,13 +168,13 @@ fn writeLog(_: ?*anyopaque, extension: []const u8, level: engine.LogLevel, messa
 /// records, and returns the resulting listing, which the caller owns.
 pub fn execute(gpa: Allocator, action: listing.Action, home_override: ?[]const u8) !listing.Listing {
     const home = home_override orelse io_mod.homeDir() orelse return error.HomeNotSet;
-    if (action.target()) |name| {
-        var before = try catalog_mod.Catalog.load(gpa, home);
-        defer before.deinit();
-        try apply(gpa, home, &before, action, name);
-    }
-    var catalog = try catalog_mod.Catalog.load(gpa, home);
+    var catalog = try catalog_mod.Catalog.load(gpa, home, .full);
     errdefer catalog.deinit();
+    if (action.target()) |name| {
+        try apply(gpa, home, &catalog, action, name);
+        // The listing shows the files the action applied to.
+        try catalog.refresh(home, name);
+    }
     return catalog.intoListing(action);
 }
 
@@ -475,6 +475,52 @@ test "trust with a digest refuses files that changed since they were listed" {
     var current = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy", .sha256 = after.find("policy").?.sha256[0..12] } }, home.home);
     defer current.deinit();
     try std.testing.expectEqual(listing.State.trusted, current.find("policy").?.state);
+}
+
+test "an untrusted extension needs review at session start without fx reading its files" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    trusted.deinit();
+    try home.tmp.dir.createDirPath(std.testing.io, ".fx/extensions/fresh");
+    try home.tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".fx/extensions/fresh/manifest.lua",
+        .data = "return { name = \"fresh\", events = { \"stop\" } }",
+    });
+    // Reading a link to itself fails for root too.
+    try home.tmp.dir.symLink(std.testing.io, "main.lua", ".fx/extensions/fresh/main.lua", .{});
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    try std.testing.expectEqual(@as(usize, 1), summary.loaded);
+    try std.testing.expectEqual(@as(usize, 1), summary.needs_review.len);
+    try std.testing.expectEqualStrings("fresh", summary.needs_review[0]);
+    try std.testing.expectEqual(@as(usize, 0), summary.load_failures.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.stopped_invalid.len);
+}
+
+test "a disabled extension gets nothing at session start, even after its files change" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var result = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    result.deinit();
+    result = try execute(std.testing.allocator, .{ .disable = "policy" }, home.home);
+    result.deinit();
+    // Only hashing the files would show this change.
+    try home.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/extensions/policy/main.lua", .data = "-- changed\n" });
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    try std.testing.expectEqual(@as(usize, 0), summary.loaded);
+    try std.testing.expectEqual(@as(usize, 0), summary.needs_review.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.load_failures.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.stopped_invalid.len);
 }
 
 test "an extensions folder that cannot be read is reported at session start" {

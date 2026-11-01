@@ -51,33 +51,58 @@ const Extension = struct {
     last_error: ?[]const u8 = null,
 };
 
+/// How much of each extension `Catalog.load` reads.
+pub const Depth = enum {
+    /// Every file, hash, manifest, and problem, for `fx extensions` and
+    /// `/extensions`, where the user reviews them.
+    full,
+    /// Only what decides what runs when a session starts. An extension
+    /// with no trusted digest needs review and a disabled one does not
+    /// run, so fx reads neither one's files, and their state comes from
+    /// the trust record alone: a disabled one that changed stays disabled.
+    session,
+};
+
 pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     home: []const u8,
     directory: []const u8,
     extensions: []Extension,
 
-    /// Reads every extension and the profile's trust records. The catalog
-    /// owns everything it returns; free it with `deinit` or `intoListing`.
-    pub fn load(gpa: Allocator, home: []const u8) !Catalog {
+    /// Reads the extensions and the profile's trust records, as deeply as
+    /// `depth` asks. The catalog owns everything it returns; free it with
+    /// `deinit` or `intoListing`.
+    pub fn load(gpa: Allocator, home: []const u8, depth: Depth) !Catalog {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
         const fx_root = try profile_paths.rootDir(a, home);
         const directory = try std.Io.Dir.path.join(a, &.{ fx_root, extensions_dir_name });
-        const extensions = try discover(a, gpa, directory);
-        // Without extensions there is nothing to trust, so settings stay unread.
-        const records = if (extensions.len == 0) TrustRecords{} else try loadTrustRecords(a, home);
-        for (extensions) |*extension| {
-            try decideState(a, extension, records);
-            if (extension.state == .trusted) try readFailures(a, fx_root, extension);
-        }
+        const extensions = try readExtensions(a, gpa, home, directory, depth);
         return .{
             .arena = arena,
             .home = try a.dupe(u8, home),
             .directory = directory,
             .extensions = extensions,
         };
+    }
+
+    /// Decides `name`'s state again from the trust and failure records as
+    /// they are now, after an action changed them. Its files are not read
+    /// again.
+    pub fn refresh(self: *Catalog, home: []const u8, name: []const u8) !void {
+        const extension = self.find(name) orelse return;
+        const a = self.arena.allocator();
+        extension.* = .{
+            .name = extension.name,
+            .files = extension.files,
+            .hashes = extension.hashes,
+            .sha256 = extension.sha256,
+            .manifest = extension.manifest,
+            .problem = extension.problem,
+        };
+        try decideState(a, extension, try loadTrustRecords(a, home));
+        if (extension.state == .trusted) try readFailures(a, try profile_paths.rootDir(a, home), extension);
     }
 
     pub fn deinit(self: *Catalog) void {
@@ -181,14 +206,41 @@ fn loadTrustRecords(a: Allocator, home: []const u8) !TrustRecords {
     return .{ .object = extensions.object };
 }
 
-fn discover(a: Allocator, gpa: Allocator, directory: []const u8) ![]Extension {
+fn readExtensions(a: Allocator, gpa: Allocator, home: []const u8, directory: []const u8, depth: Depth) ![]Extension {
     const io = io_mod.getIo();
     var dir = std.Io.Dir.openDirAbsolute(io, directory, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return &.{},
         else => return err,
     };
     defer dir.close(io);
+    const extensions = try discover(a, dir);
+    // Without extensions there is nothing to trust, so settings stay unread.
+    if (extensions.len == 0) return extensions;
+    const records = try loadTrustRecords(a, home);
+    const fx_root = try profile_paths.rootDir(a, home);
+    for (extensions) |*extension| {
+        if (extension.problem == null) {
+            const record = records.get(extension.name);
+            if (depth == .session and record.sha256 == null) {
+                extension.state = .needs_review;
+                continue;
+            }
+            if (depth == .session and record.disabled) {
+                extension.state = .disabled;
+                continue;
+            }
+            extension.* = try readExtension(a, gpa, dir, extension.name);
+        }
+        try decideState(a, extension, records);
+        if (extension.state == .trusted) try readFailures(a, fx_root, extension);
+    }
+    return extensions;
+}
 
+/// Lists the extension folders, with the problems their names and kinds
+/// show before any of their files is read.
+fn discover(a: Allocator, dir: std.Io.Dir) ![]Extension {
+    const io = io_mod.getIo();
     var extensions: std.ArrayList(Extension) = .empty;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -205,14 +257,10 @@ fn discover(a: Allocator, gpa: Allocator, directory: []const u8) ![]Extension {
             else => continue,
         }
         const name = try a.dupe(u8, entry.name);
-        if (!engine.validExtensionName(name)) {
-            try extensions.append(a, .{
-                .name = name,
-                .problem = "the folder name must be lowercase letters, digits, '_' or '-'",
-            });
-            continue;
-        }
-        try extensions.append(a, try readExtension(a, gpa, dir, name));
+        try extensions.append(a, .{
+            .name = name,
+            .problem = if (engine.validExtensionName(name)) null else "the folder name must be lowercase letters, digits, '_' or '-'",
+        });
     }
     std.mem.sort(Extension, extensions.items, {}, extensionLessThan);
     return extensions.items;
@@ -611,7 +659,7 @@ test "a new extension needs review and a trusted one runs until it changes" {
     try home.write("policy/main.lua", "agent.on('pre_tool_use', function() end)");
     try home.write("policy/README.md", "not hashed");
 
-    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     const first = catalog.find("policy").?;
     try std.testing.expectEqual(listing.State.needs_review, first.state);
     try std.testing.expectEqual(@as(usize, 2), first.files.len);
@@ -626,17 +674,17 @@ test "a new extension needs review and a trusted one runs until it changes" {
     , .{ digest, main_hash });
     defer std.testing.allocator.free(settings);
     try home.writeSettings(settings);
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     try std.testing.expectEqual(listing.State.trusted, catalog.find("policy").?.state);
     catalog.deinit();
 
     try home.write("policy/README.md", "still not hashed");
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     try std.testing.expectEqual(listing.State.trusted, catalog.find("policy").?.state);
     catalog.deinit();
 
     try home.write("policy/main.lua", "-- weakened");
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     defer catalog.deinit();
     const changed = catalog.find("policy").?;
     try std.testing.expectEqual(listing.State.needs_review, changed.state);
@@ -654,7 +702,7 @@ test "a broken folder or manifest makes the extension invalid" {
     try home.write("Upper/manifest.lua", policy_manifest);
     try home.write("nomain/manifest.lua", "return { name = \"nomain\", events = { \"stop\" } }");
 
-    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     defer catalog.deinit();
     try std.testing.expectEqual(@as(usize, 4), catalog.extensions.len);
     try std.testing.expectEqualStrings("manifest.lua is missing", catalog.find("nomanifest").?.problem.?);
@@ -669,7 +717,7 @@ test "failure records count only for the contents they were written for" {
     defer home.deinit();
     try home.write("policy/manifest.lua", policy_manifest);
     try home.write("policy/main.lua", "");
-    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     const digest = try std.testing.allocator.dupe(u8, catalog.find("policy").?.sha256);
     defer std.testing.allocator.free(digest);
     catalog.deinit();
@@ -681,7 +729,7 @@ test "failure records count only for the contents they were written for" {
 
     recordFailure(std.testing.allocator, home.home, "policy", digest, "boom");
     recordFailure(std.testing.allocator, home.home, "policy", digest, "boom again");
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     var entry = catalog.find("policy").?;
     try std.testing.expectEqual(listing.State.failing, entry.state);
     try std.testing.expectEqual(@as(u64, 2), entry.failures);
@@ -689,7 +737,7 @@ test "failure records count only for the contents they were written for" {
     catalog.deinit();
 
     try clearFailures(std.testing.allocator, home.home, "policy");
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     defer catalog.deinit();
     entry = catalog.find("policy").?;
     try std.testing.expectEqual(listing.State.trusted, entry.state);
@@ -700,7 +748,7 @@ test "failures recorded by processes at the same time all stay counted" {
     defer home.deinit();
     try home.write("policy/manifest.lua", policy_manifest);
     try home.write("policy/main.lua", "");
-    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     const digest = try std.testing.allocator.dupe(u8, catalog.find("policy").?.sha256);
     defer std.testing.allocator.free(digest);
     catalog.deinit();
@@ -731,7 +779,7 @@ test "failures recorded by processes at the same time all stay counted" {
     for (threads) |thread| thread.join();
 
     try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
-    catalog = try Catalog.load(std.testing.allocator, home.home);
+    catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     defer catalog.deinit();
     try std.testing.expectEqual(@as(u64, 200), catalog.find("policy").?.failures);
 }
@@ -741,7 +789,7 @@ test "failures counted before a clear never come back" {
     defer home.deinit();
     try home.write("policy/manifest.lua", policy_manifest);
     try home.write("policy/main.lua", "");
-    var catalog = try Catalog.load(std.testing.allocator, home.home);
+    var catalog = try Catalog.load(std.testing.allocator, home.home, .full);
     const digest = try std.testing.allocator.dupe(u8, catalog.find("policy").?.sha256);
     defer std.testing.allocator.free(digest);
     catalog.deinit();
@@ -807,7 +855,7 @@ test "failures counted before a clear never come back" {
         }
 
         try std.testing.expectEqual(@as(usize, 0), writers.failed.load(.monotonic));
-        catalog = try Catalog.load(std.testing.allocator, home.home);
+        catalog = try Catalog.load(std.testing.allocator, home.home, .full);
         defer catalog.deinit();
         // Only failures the threads recorded can remain.
         const remaining = catalog.find("policy").?.failures;
@@ -832,7 +880,7 @@ test "a folder that cannot be opened makes only its extension invalid" {
     // Four spare descriptors hold the extensions folder, the extension
     // folder, a, and b, so opening broken/a/b/c fails.
     var limit = try OpenFileLimit.init(home.tmp.dir, 4);
-    var catalog = Catalog.load(std.testing.allocator, home.home);
+    var catalog = Catalog.load(std.testing.allocator, home.home, .full);
     limit.restore();
     defer if (catalog) |*loaded| loaded.deinit() else |_| {};
 
@@ -856,7 +904,7 @@ test "a file that cannot be read makes only its extension invalid" {
     // Three spare descriptors hold the extensions folder, the extension
     // folder, and a, so reading broken/a/deep.lua fails.
     var limit = try OpenFileLimit.init(home.tmp.dir, 3);
-    var catalog = Catalog.load(std.testing.allocator, home.home);
+    var catalog = Catalog.load(std.testing.allocator, home.home, .full);
     limit.restore();
     defer if (catalog) |*loaded| loaded.deinit() else |_| {};
 

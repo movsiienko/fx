@@ -208,11 +208,16 @@ test "the session-start notice names a trusted extension that became invalid" {
     );
 }
 
-test "an invalid extension that was never trusted gets no session-start notice" {
+test "an invalid extension that was never trusted needs review at session start" {
     if (!enabled) return error.SkipZigTest;
-    const notice = try noticeAfterBreakingExtension(false);
-    defer if (notice) |text| std.testing.allocator.free(text);
-    try std.testing.expectEqual(null, notice);
+    // Session start reads no files of an untrusted extension, so it cannot
+    // know the extension is invalid; `fx extensions list` shows why.
+    const notice = (try noticeAfterBreakingExtension(false)) orelse return error.TestExpectedNotice;
+    defer std.testing.allocator.free(notice);
+    try std.testing.expectEqualStrings(
+        "Lua extension policy is new or changed and won't run until you review it. Run fx extensions list to see it.",
+        notice,
+    );
 }
 
 test {
