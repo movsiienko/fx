@@ -301,7 +301,11 @@ pub const Extension = struct {
         if (self.meter.isStopped()) return self.stoppedError(diagnostic);
 
         bridge.checkValue(input) catch |err| {
-            diagnostic.print("hook input is not valid JSON ({s})", .{bridge.describe(err)});
+            if (err == error.NestedTooDeeply) {
+                diagnostic.print("hook input is nested more than {d} levels deep, deeper than Lua accepts", .{bridge.max_depth});
+            } else {
+                diagnostic.print("hook input is not valid JSON ({s})", .{bridge.describe(err)});
+            }
             return error.InvalidInput;
         };
         // Scratch memory counts against the budget, so keep little of it.
@@ -1314,7 +1318,7 @@ fn fuzzValueBridge(_: void, smith: *std.testing.Smith) !void {
     var diagnostic: Diagnostic = .{};
     const result = ext.call(arena.allocator(), .stop, .{ .object = wrapped }, &diagnostic) catch |err| switch (err) {
         // Nesting past the bridge's depth limit is refused, not crashed on.
-        error.HookFailed, error.InvalidResult => return,
+        error.InvalidInput, error.HookFailed, error.InvalidResult => return,
         else => return err,
     };
     // JSON null arrives as agent.json.null, which converts back to null.

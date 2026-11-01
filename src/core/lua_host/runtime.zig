@@ -8,6 +8,7 @@ const settings_store = @import("../config/settings_store.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const adapter = @import("adapter.zig");
 const catalog_mod = @import("catalog.zig");
 const listing = @import("listing.zig");
@@ -328,6 +329,105 @@ test "a Lua error's terminal sequences do not reach the block reason" {
     try std.testing.expect(std.mem.findAny(u8, failed.blocked, "\x1b\x07") == null);
     try std.testing.expect(std.mem.find(u8, failed.blocked, "policy/main.lua:9: \\x1b]52;c;aGk=\\x07") != null);
     try std.testing.expect(failed.blocked.len <= hooks.Limits.reason_bytes);
+}
+
+test "tool arguments that are not a JSON object skip the Lua hook without counting a failure" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    trusted.deinit();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    _ = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    const view = runtime.freeze();
+
+    // The policy indexes `ev.arguments.command`, which would raise on nil.
+    var malformed = try testPreToolUse(view, .ask, "shell", "{\"command\":");
+    defer malformed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.unchanged, std.meta.activeTag(malformed));
+    var array = try testPreToolUse(view, .ask, "shell", "[\"rm -rf build\"]");
+    defer array.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.unchanged, std.meta.activeTag(array));
+
+    var after = try execute(std.testing.allocator, .list, home.home);
+    defer after.deinit();
+    const entry = after.find("policy").?;
+    try std.testing.expectEqual(listing.State.trusted, entry.state);
+    try std.testing.expectEqual(@as(u64, 0), entry.failures);
+}
+
+test "input fx cannot pass to a Lua hook blocks the tool call without counting a failure" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    trusted.deinit();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    _ = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    const view = runtime.freeze();
+
+    var refused = try testPreToolUse(view, .ask, "shell\xff", "{\"command\":\"ls\"}");
+    defer refused.deinit(std.testing.allocator);
+    try std.testing.expectStringStartsWith(refused.blocked, "fx could not pass this tool call to Lua hook lua.policy.pre_tool_use");
+    try std.testing.expect(std.mem.find(u8, refused.blocked, "fx extensions disable") == null);
+
+    // Other hooks fail open.
+    var stop = view.runStop(std.testing.allocator, .{
+        .invocation = .{ .scope = .{ .kind = .ask, .workspace_root = "/Users/example/project" } },
+        .step_index = 0,
+        .assistant_text = "done\xff",
+        .provider_disposition = .completed,
+        .can_continue = true,
+    });
+    defer stop.deinit(std.testing.allocator);
+    try std.testing.expect(stop == .allow);
+
+    var before_failure = try execute(std.testing.allocator, .list, home.home);
+    const entry = before_failure.find("policy").?;
+    try std.testing.expectEqual(listing.State.trusted, entry.state);
+    try std.testing.expectEqual(@as(u64, 0), entry.failures);
+    before_failure.deinit();
+
+    // A hook that errors is still the extension's failure.
+    var failed = try testPreToolUse(view, .ask, "explode", "{}");
+    defer failed.deinit(std.testing.allocator);
+    try std.testing.expectStringStartsWith(failed.blocked, "Lua hook lua.policy.pre_tool_use failed, so fx blocked this tool call: policy/main.lua:8: kaboom.");
+    try std.testing.expect(std.mem.find(u8, failed.blocked, "fx extensions disable policy") != null);
+    var after = try execute(std.testing.allocator, .list, home.home);
+    defer after.deinit();
+    try std.testing.expectEqual(listing.State.failing, after.find("policy").?.state);
+    try std.testing.expectEqual(@as(u64, 1), after.find("policy").?.failures);
+}
+
+test "arguments nested too deeply for Lua block the tool call without counting a failure" {
+    var home = try TestHome.init();
+    defer home.deinit();
+    var trusted = try execute(std.testing.allocator, .{ .trust = .{ .name = "policy" } }, home.home);
+    trusted.deinit();
+
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    _ = try lua_hooks.register(std.testing.allocator, &runtime, .{ .home = home.home });
+    const view = runtime.freeze();
+
+    const deep = "{\"command\":\"ls\",\"nested\":" ++ text_utils.repeat("[", 100) ++ text_utils.repeat("]", 100) ++ "}";
+    var refused = try testPreToolUse(view, .ask, "shell", deep);
+    defer refused.deinit(std.testing.allocator);
+    try std.testing.expectStringStartsWith(refused.blocked, "fx could not pass this tool call to Lua hook lua.policy.pre_tool_use");
+    try std.testing.expect(std.mem.find(u8, refused.blocked, "nested") != null);
+
+    var after = try execute(std.testing.allocator, .list, home.home);
+    defer after.deinit();
+    try std.testing.expectEqual(listing.State.trusted, after.find("policy").?.state);
+    try std.testing.expectEqual(@as(u64, 0), after.find("policy").?.failures);
 }
 
 test "disable and enable switch a trusted extension without forgetting its review" {

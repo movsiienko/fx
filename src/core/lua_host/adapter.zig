@@ -4,8 +4,9 @@
 //!
 //! `PreToolUse` fails closed: when a Lua hook errors, runs out of budget, or
 //! returns something fx does not understand, the tool call is blocked with a
-//! reason that names the hook and how to turn it off. The other hooks fail
-//! open. A rewrite changes only arguments, and the rewritten call still goes
+//! reason that names the hook and how to turn it off. Input fx cannot hand
+//! to Lua also blocks the call, but is not counted against the extension.
+//! The other hooks fail open. A rewrite changes only arguments, and the rewritten call still goes
 //! through fx's validation and permissions, so a hook can narrow what the
 //! agent does but never approve anything.
 
@@ -127,13 +128,19 @@ const LuaHook = struct {
     }
 
     /// Calls the Lua handler. A failure is counted and its reason returned.
+    /// Input the engine refuses is fx's problem, not the extension's, so it
+    /// is not counted.
     fn call(self: *LuaHook, arena: Allocator, input: anytype) CallOutcome {
         const value = inputValue(arena, input) catch
             return self.failed(arena, "not enough memory to build the hook input");
         var diagnostic: engine.Diagnostic = .{};
-        const result = self.loaded.lua.call(arena, self.event, value, &diagnostic) catch |err| {
-            if (err == error.OutOfMemory) return self.failed(arena, "not enough memory");
-            return self.failed(arena, diagnostic.message());
+        const result = self.loaded.lua.call(arena, self.event, value, &diagnostic) catch |err| switch (err) {
+            error.OutOfMemory => return self.failed(arena, "not enough memory"),
+            error.InvalidInput => {
+                debug_trace.logf("lua_hooks", "event=input_refused handler={s} error={s}", .{ self.name(), diagnostic.message() });
+                return .{ .refused = arena.dupe(u8, diagnostic.message()) catch "not enough memory" };
+            },
+            else => return self.failed(arena, diagnostic.message()),
         };
         return .{ .value = result orelse .null };
     }
@@ -158,6 +165,17 @@ const LuaHook = struct {
         const reason = arena.print(
             "Lua hook {s} failed, so fx blocked this tool call: {s}. Turn the extension off with `fx extensions disable {s}`.",
             .{ self.name(), safe_message.bytes, self.loaded.name },
+        ) catch return error.Failed;
+        return .{ .block = try self.keep(truncateUtf8(reason, hooks.Limits.reason_bytes)) };
+    }
+
+    /// The block reason when fx could not hand a `PreToolUse` call to the
+    /// hook. A policy that cannot see the call must not let it through, but
+    /// the extension did nothing wrong. `message` is the engine's own text.
+    fn refuseClosed(self: *LuaHook, arena: Allocator, message: []const u8) hooks.HandlerError!hooks.PreToolUseAction {
+        const reason = arena.print(
+            "fx could not pass this tool call to Lua hook {s}, so fx blocked it: {s}.",
+            .{ self.name(), message },
         ) catch return error.Failed;
         return .{ .block = try self.keep(truncateUtf8(reason, hooks.Limits.reason_bytes)) };
     }
@@ -202,6 +220,8 @@ fn inputValue(arena: Allocator, input: anytype) Allocator.Error!std.json.Value {
 const CallOutcome = union(enum) {
     value: std.json.Value,
     failure: []const u8,
+    /// fx could not hand the input to Lua; not counted as a failure.
+    refused: []const u8,
 };
 
 /// What each calling thread's hook returned last. Subagents can call one
@@ -263,9 +283,14 @@ fn runPreToolUse(ctx: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerErr
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Arguments arrive before validation, so they may not be a JSON object.
-    const arguments = std.json.parseFromSliceLeaky(std.json.Value, arena, input.arguments_json, .{}) catch null;
-    const valid_arguments = arguments != null and arguments.? == .object;
+    // fx blocks a call whose arguments are not a JSON object before
+    // `PreToolUse` runs, and admits only object rewrites, so such a call
+    // never runs and the hook has nothing to judge.
+    const arguments = std.json.parseFromSliceLeaky(std.json.Value, arena, input.arguments_json, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.Failed;
+        return .continue_;
+    };
+    if (arguments != .object) return .continue_;
     const outcome = hook.call(arena, .{
         .event = "pre_tool_use",
         .scope = ScopeInput.of(input.invocation),
@@ -273,13 +298,11 @@ fn runPreToolUse(ctx: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerErr
         .step_index = input.step_index,
         .call_id = input.call_id,
         .tool_name = input.tool_name,
-        .arguments = if (valid_arguments) arguments else null,
-        // The raw text only when it is not a JSON object, so a large write
-        // reaches Lua once.
-        .arguments_json = if (valid_arguments) null else input.arguments_json,
+        .arguments = arguments,
     });
     const value = switch (outcome) {
         .failure => |message| return hook.failClosed(arena, message),
+        .refused => |message| return hook.refuseClosed(arena, message),
         .value => |value| value,
     };
     const expected = "nothing, { arguments = {...} } or { block = \"reason\" }";
@@ -326,7 +349,7 @@ fn runStop(ctx: *anyopaque, input: hooks.StopInput) hooks.HandlerError!hooks.Sto
     });
     const value = switch (outcome) {
         // Fails open: the turn completes.
-        .failure => return .allow,
+        .failure, .refused => return .allow,
         .value => |value| value,
     };
     if (value == .null or (value == .object and value.object.count() == 0)) return .allow;
@@ -353,7 +376,7 @@ fn runPostTurnEnd(ctx: *anyopaque, input: hooks.PostTurnEndInput) hooks.HandlerE
         .outcome = @tagName(input.outcome),
         .provider_disposition = if (input.provider_disposition) |disposition| @tagName(disposition) else null,
     });
-    if (outcome == .failure) return error.Failed;
+    if (outcome != .value) return error.Failed;
 }
 
 fn runAttentionRequired(ctx: *anyopaque, input: hooks.AttentionRequiredInput) hooks.HandlerError!void {
@@ -367,5 +390,5 @@ fn runAttentionRequired(ctx: *anyopaque, input: hooks.AttentionRequiredInput) ho
         .turn_id = input.invocation.turn_id,
         .kind = @tagName(input.kind),
     });
-    if (outcome == .failure) return error.Failed;
+    if (outcome != .value) return error.Failed;
 }

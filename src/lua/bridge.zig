@@ -8,7 +8,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 
-const max_depth = 64;
+pub const max_depth = 64;
 
 /// The address behind `agent.json.null`.
 var json_null_marker: u8 = 0;
@@ -133,15 +133,14 @@ pub fn toValue(
     return builder.value(c.lua_absindex(L, idx), 0);
 }
 
-/// Checks that `value` holds what valid JSON would: UTF-8 strings and keys,
-/// and finite numbers. Past `max_depth` it stops looking, because `push`
-/// refuses a value nested that deeply.
+/// Checks that `value` holds what valid JSON would, UTF-8 strings and keys
+/// and finite numbers, nested no deeper than `push` accepts.
 pub fn checkValue(value: std.json.Value) EncodeError!void {
     try checkValueAt(value, 0);
 }
 
 fn checkValueAt(value: std.json.Value, depth: usize) EncodeError!void {
-    if (depth > max_depth) return;
+    if (depth > max_depth) return error.NestedTooDeeply;
     switch (value) {
         .null, .bool, .integer, .number_string => {},
         .float => |f| if (!std.math.isFinite(f)) return error.NonFiniteNumber,
