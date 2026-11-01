@@ -4682,6 +4682,15 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
     }
 }
 
+// A named test, unlike `test {}`, is analyzed only when the test filter
+// selects it. The ANSI span test in assistant_stream.zig compiles this file
+// again with plain `zig test`, which has no build_options or lua_c module,
+// so the Lua host must stay out of the block below.
+test "lua extension hooks" {
+    _ = @import("core/lua_host/lua_host.zig");
+    _ = @import("lua/engine.zig");
+}
+
 test {
     _ = @import("core/agent/runtime/journal.zig");
     _ = @import("acp/libfx_journal.zig");
