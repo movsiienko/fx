@@ -436,7 +436,7 @@ pub const ExtensionsSnapshot = struct {
         };
     }
 
-    pub fn renderText(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
+    fn renderText(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
         return self.renderLines(alloc, "[extensions] ", "fx extensions");
     }
 
@@ -549,7 +549,7 @@ pub const ExtensionsSnapshot = struct {
         }
     }
 
-    pub fn renderJson(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
+    fn renderJson(self: ExtensionsSnapshot, alloc: Allocator) ![]u8 {
         const Entry = struct {
             name: []const u8,
             version: []const u8,

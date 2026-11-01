@@ -4,7 +4,10 @@
 # because it holds the lua_manifest fuzz target. The engine imports only the standard
 # library, its own files, and the translated Lua header (lua_c), so it holds
 # no fx state and reads no files: the host hands it every file an extension
-# may load. Only src/core/lua_host adapts it to fx's hook runtime.
+# may load. Only src/core/lua_host adapts it to fx's hook runtime. The
+# composition root src/main.zig imports engine.zig only in its "lua extension
+# hooks" test, which is how the test build reaches the engine's own tests,
+# and the fuzz root imports it for the engine's fuzz targets.
 # The build compiles stock Lua and must leave out the libraries the sandbox
 # never opens.
 

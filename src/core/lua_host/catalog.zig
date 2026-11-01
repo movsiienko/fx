@@ -65,7 +65,6 @@ pub const Depth = enum {
 
 pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
-    home: []const u8,
     directory: []const u8,
     extensions: []Extension,
 
@@ -81,7 +80,6 @@ pub const Catalog = struct {
         const extensions = try readExtensions(a, gpa, home, directory, depth);
         return .{
             .arena = arena,
-            .home = try a.dupe(u8, home),
             .directory = directory,
             .extensions = extensions,
         };
