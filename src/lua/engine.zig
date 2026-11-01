@@ -786,6 +786,8 @@ fn loadForTest(main: []const u8, extra: []const SourceFile, options: struct {
         .log = options.log,
     }, &diagnostic) catch |err| {
         std.debug.print("load failed: {s}\n", .{diagnostic.message()});
+        // A load that ran past its time limit leaves a worker behind.
+        try waitForWorkers();
         return err;
     };
 }
@@ -968,16 +970,22 @@ fn waitForWorkers() !void {
     }
 }
 
+/// Limits for the tests of calls that run past their time limit. Each slow
+/// call takes seconds in a Debug build and still far longer than 100 ms in
+/// ReleaseSafe, and 100 ms leaves room for a loaded machine to start the
+/// worker and load the extension.
+const slow_call_limits: Limits = .{ .memory_bytes = 8 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 100 };
+
 test "a pattern that backtracks for seconds is stopped at the time limit" {
     const ext = try loadForTest(
         \\agent.on("stop", function()
-        \\  local s = string.rep("a", 600)
+        \\  local s = string.rep("a", 900)
         \\  return { continue = tostring(s:find(".-.-b")) }
         \\end)
         \\agent.on("post_turn_end", function() return { ok = true } end)
-    , &.{}, .{ .limits = .{ .memory_bytes = 2 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 } });
+    , &.{}, .{ .limits = slow_call_limits });
     const started = std.Io.Clock.awake.now(std.testing.io);
-    try expectCallFails(ext, .stop, "{}", error.TimedOut, "ran past its 10 ms time limit");
+    try expectCallFails(ext, .stop, "{}", error.TimedOut, "ran past its 100 ms time limit");
     const elapsed = started.untilNow(std.testing.io, .awake);
     try std.testing.expect(elapsed.toMilliseconds() < 5_000);
     // The extension stays stopped, even for a hook that would be quick.
@@ -988,10 +996,12 @@ test "a pattern that backtracks for seconds is stopped at the time limit" {
 
 test "a worst-case plain find is stopped at the time limit" {
     const ext = try loadForTest(
-        \\local s = string.rep("a", 1024 * 1024)
-        \\local p = string.rep("a", 2048) .. "b"
-        \\agent.on("stop", function() return { continue = tostring(s:find(p, 1, true)) } end)
-    , &.{}, .{ .limits = .{ .memory_bytes = 8 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 } });
+        \\agent.on("stop", function()
+        \\  local s = string.rep("a", 1024 * 1024)
+        \\  local p = string.rep("a", 8192) .. "b"
+        \\  return { continue = tostring(s:find(p, 1, true)) }
+        \\end)
+    , &.{}, .{ .limits = slow_call_limits });
     try expectCallFails(ext, .stop, "{}", error.TimedOut, "time limit");
     ext.deinit();
     try waitForWorkers();
@@ -1000,16 +1010,16 @@ test "a worst-case plain find is stopped at the time limit" {
 test "main code that runs past the time limit fails the load" {
     var diagnostic: Diagnostic = .{};
     const files = [_]SourceFile{.{ .path = "main.lua", .bytes =
-        \\local s = string.rep("a", 600)
+        \\local s = string.rep("a", 900)
         \\s:find(".-.-b")
     }};
     try std.testing.expectError(error.LoadFailed, Extension.load(std.testing.allocator, std.testing.io, .{
         .name = "test",
         .files = &files,
         .events = .full,
-        .limits = .{ .timeout_ms = 10 },
+        .limits = slow_call_limits,
     }, &diagnostic));
-    try std.testing.expect(std.mem.find(u8, diagnostic.message(), "ran past its 10 ms time limit") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.message(), "ran past its 100 ms time limit") != null);
     try waitForWorkers();
 }
 
@@ -1019,11 +1029,11 @@ test "a stopped extension writes no more log lines" {
     const ext = try loadForTest(
         \\agent.on("stop", function()
         \\  print("before")
-        \\  local s = string.rep("a", 600)
+        \\  local s = string.rep("a", 900)
         \\  s:find(".-.-b")
         \\  print("after")
         \\end)
-    , &.{}, .{ .limits = .{ .memory_bytes = 2 * 1024 * 1024, .instructions_per_call = 1_000_000, .timeout_ms = 10 }, .log = log.sink() });
+    , &.{}, .{ .limits = slow_call_limits, .log = log.sink() });
     try expectCallFails(ext, .stop, "{}", error.TimedOut, "time limit");
     ext.deinit();
     try waitForWorkers();
