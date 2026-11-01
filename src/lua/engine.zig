@@ -17,7 +17,10 @@
 //! `setmetatable` refuses `__gc` (Lua runs finalizers with hooks off), and
 //! every call runs on a worker thread under the extension's time limit. A
 //! call that misses it is abandoned: the extension is stopped for the rest
-//! of the session, and the worker frees it once Lua's C code returns.
+//! of the session, the worker drops to the lowest CPU priority, and it
+//! frees the extension once Lua's C code returns. Only one worker per
+//! extension can be abandoned, because a stopped extension is never called
+//! again.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -25,6 +28,7 @@ const budget_mod = @import("budget.zig");
 const bridge = @import("bridge.zig");
 const manifest_mod = @import("manifest.zig");
 const types = @import("types.zig");
+const priority = @import("priority.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -378,6 +382,9 @@ pub const Extension = struct {
             self.log_mutex.lockUncancelable(io);
             self.meter.stop();
             self.log_mutex.unlock(io);
+            // The worker runs until Lua's C code returns; keep it off the CPU
+            // that fx and everything else need.
+            priority.lowest(thread);
             thread.detach();
             diagnostic.print("the hook ran past its {d} ms time limit, so fx stopped this extension until it restarts", .{self.limits.timeout_ms});
             return error.TimedOut;
@@ -944,6 +951,7 @@ test "the memory cap stops a memory bomb and the state stays usable" {
 }
 
 test {
+    _ = @import("priority.zig");
     _ = bridge;
     _ = budget_mod;
     _ = manifest_mod;
