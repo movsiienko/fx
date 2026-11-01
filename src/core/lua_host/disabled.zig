@@ -13,6 +13,7 @@ pub const Summary = struct {
     loaded: usize = 0,
     needs_review: []const []const u8 = &.{},
     load_failures: []const LoadFailure = &.{},
+    stopped_invalid: []const LoadFailure = &.{},
     unreadable_folder: ?UnreadableFolder = null,
 };
 

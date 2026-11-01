@@ -25,6 +25,9 @@ pub const Summary = struct {
     loaded: usize = 0,
     needs_review: []const []const u8 = &.{},
     load_failures: []const LoadFailure = &.{},
+    /// Trusted extensions that are now invalid, so they stopped running.
+    /// Each message is the catalog's problem.
+    stopped_invalid: []const LoadFailure = &.{},
     /// Set when `~/.fx/extensions/` exists but cannot be read, so no
     /// extension loaded.
     unreadable_folder: ?UnreadableFolder = null,
@@ -77,8 +80,13 @@ pub const Hooks = struct {
         const owned_home = try a.dupe(u8, home);
         var needs_review: std.ArrayList([]const u8) = .empty;
         var load_failures: std.ArrayList(LoadFailure) = .empty;
+        var stopped_invalid: std.ArrayList(LoadFailure) = .empty;
         for (catalog.extensions) |extension| {
             if (extension.state == .needs_review) try needs_review.append(a, try a.dupe(u8, extension.name));
+            if (extension.stopped_by_problem) try stopped_invalid.append(a, .{
+                .name = try a.dupe(u8, extension.name),
+                .message = try a.dupe(u8, extension.problem.?),
+            });
             if (!extension.state.runs()) continue;
             const manifest = extension.manifest.?;
             var diagnostic: engine.Diagnostic = .{};
@@ -117,15 +125,17 @@ pub const Hooks = struct {
             };
             try loaded.register(runtime);
         }
-        debug_trace.logf("lua_hooks", "event=registered loaded={d} needs_review={d} load_failures={d}", .{
+        debug_trace.logf("lua_hooks", "event=registered loaded={d} needs_review={d} load_failures={d} stopped_invalid={d}", .{
             self.loaded.items.len,
             needs_review.items.len,
             load_failures.items.len,
+            stopped_invalid.items.len,
         });
         return .{
             .loaded = self.loaded.items.len,
             .needs_review = needs_review.items,
             .load_failures = load_failures.items,
+            .stopped_invalid = stopped_invalid.items,
         };
     }
 

@@ -39,6 +39,9 @@ const Extension = struct {
     manifest: ?engine.Manifest = null,
     problem: ?[]const u8 = null,
     state: listing.State = .invalid,
+    /// Set when the user trusted and did not disable this extension, but
+    /// it is now invalid, so it stopped running.
+    stopped_by_problem: bool = false,
     changed_files: []const []const u8 = &.{},
     failures: u64 = 0,
     last_error: ?[]const u8 = null,
@@ -379,11 +382,12 @@ fn hexDigest(bytes: []const u8) Hex {
 }
 
 fn decideState(a: Allocator, extension: *Extension, records: TrustRecords) !void {
+    const record = records.get(extension.name);
     if (extension.problem != null) {
         extension.state = .invalid;
+        extension.stopped_by_problem = record.sha256 != null and !record.disabled;
         return;
     }
-    const record = records.get(extension.name);
     const trusted = record.sha256 orelse {
         extension.state = .needs_review;
         return;

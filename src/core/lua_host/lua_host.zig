@@ -46,7 +46,8 @@ pub fn AppRuntime(comptime App: type) type {
 /// since anything that can write to `~/.fx/extensions/` chooses them.
 /// The caller owns the result.
 pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []const u8) !?[]u8 {
-    if (summary.needs_review.len == 0 and summary.load_failures.len == 0 and summary.unreadable_folder == null) return null;
+    if (summary.needs_review.len == 0 and summary.load_failures.len == 0 and summary.stopped_invalid.len == 0 and
+        summary.unreadable_folder == null) return null;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
@@ -68,6 +69,14 @@ pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []
             try writeTerminalSafe(w, alloc, name);
         }
         try w.print(". Run {s} to see them.", .{review_command});
+    }
+    for (summary.stopped_invalid) |stopped| {
+        if (out.written().len > 0) try w.writeByte('\n');
+        try w.writeAll("Lua extension ");
+        try writeTerminalSafe(w, alloc, stopped.name);
+        try w.writeAll(" is trusted but invalid, so it won't run: ");
+        try writeTerminalSafe(w, alloc, stopped.message);
+        try w.print(". Run {s} to see it.", .{review_command});
     }
     for (summary.load_failures) |failure| {
         if (out.written().len > 0) try w.writeByte('\n');
@@ -153,6 +162,57 @@ test "the session-start notice says when the whole extensions folder cannot be r
     const expected = try alloc.print("Lua extensions in {s}/.fx/extensions cannot be read (SymLinkLoop), so none of them run.", .{home});
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, notice);
+}
+
+/// Writes extension `policy`, trusts it when `trust` is set, then makes
+/// it invalid with a main.lua over the 1 MiB limit, which fails for root
+/// too. Returns the session-start notice, which the caller owns.
+fn noticeAfterBreakingExtension(trust: bool) !?[]u8 {
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/extensions/policy");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".fx/extensions/policy/manifest.lua",
+        .data = "return { name = \"policy\", events = { \"stop\" } }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/extensions/policy/main.lua", .data = "agent.on(\"stop\", function() end)" });
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    if (trust) {
+        var trusted = try execute(alloc, .{ .trust = .{ .name = "policy" } }, home);
+        trusted.deinit();
+    }
+
+    const oversized = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, '-');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/extensions/policy/main.lua", .data = oversized });
+
+    var runtime = @import("../hooks/hooks.zig").Runtime.init(alloc);
+    defer runtime.deinit();
+    var lua_hooks: Hooks = .{};
+    defer lua_hooks.deinit();
+    const summary = try lua_hooks.register(alloc, &runtime, .{ .home = home });
+    return noticeText(alloc, summary, "fx extensions list");
+}
+
+test "the session-start notice names a trusted extension that became invalid" {
+    if (!enabled) return error.SkipZigTest;
+    const notice = (try noticeAfterBreakingExtension(true)) orelse return error.TestExpectedNotice;
+    defer std.testing.allocator.free(notice);
+    try std.testing.expectEqualStrings(
+        "Lua extension policy is trusted but invalid, so it won't run: main.lua is larger than 1 MiB. Run fx extensions list to see it.",
+        notice,
+    );
+}
+
+test "an invalid extension that was never trusted gets no session-start notice" {
+    if (!enabled) return error.SkipZigTest;
+    const notice = try noticeAfterBreakingExtension(false);
+    defer if (notice) |text| std.testing.allocator.free(text);
+    try std.testing.expectEqual(null, notice);
 }
 
 test {
