@@ -57,7 +57,7 @@ pub const Loaded = struct {
         defer self.failures.mutex.unlock(io);
         const log = &self.failures;
         log.pending += 1;
-        const kept = truncateUtf8(message, log.last_error.len);
+        const kept = text_utils.utf8PrefixByBytes(message, log.last_error.len);
         @memcpy(log.last_error[0..kept.len], kept);
         log.last_error_len = kept.len;
         const now = io_mod.milliTimestamp();
@@ -172,7 +172,7 @@ const LuaHook = struct {
             "Lua hook {s} failed, so fx blocked this tool call: {s}. Turn the extension off with `fx extensions disable {s}`.",
             .{ self.name(), safe_message.bytes, self.loaded.name },
         ) catch return error.Failed;
-        return .{ .block = try self.keep(truncateUtf8(reason, hooks.Limits.reason_bytes)) };
+        return .{ .block = try self.keep(text_utils.utf8PrefixByBytes(reason, hooks.Limits.reason_bytes)) };
     }
 
     /// The block reason when fx could not hand a `PreToolUse` call to the
@@ -183,7 +183,7 @@ const LuaHook = struct {
             "fx could not pass this tool call to Lua hook {s}, so fx blocked it: {s}.",
             .{ self.name(), message },
         ) catch return error.Failed;
-        return .{ .block = try self.keep(truncateUtf8(reason, hooks.Limits.reason_bytes)) };
+        return .{ .block = try self.keep(text_utils.utf8PrefixByBytes(reason, hooks.Limits.reason_bytes)) };
     }
 
     /// Keeps `bytes` alive until this thread calls the hook again; fx copies
@@ -255,13 +255,6 @@ const ResultSlots = struct {
     }
 };
 
-fn truncateUtf8(text: []const u8, max: usize) []const u8 {
-    if (text.len <= max) return text;
-    var end = max;
-    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    return text[0..end];
-}
-
 const ScopeInput = struct {
     kind: []const u8,
     workspace_root: []const u8,
@@ -321,7 +314,7 @@ fn runPreToolUse(ctx: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerErr
         if (reason != .string or reason.string.len == 0) {
             return hook.failClosed(arena, hook.invalid(arena, "a non-empty string as its block reason"));
         }
-        return .{ .block = try hook.keep(truncateUtf8(reason.string, hooks.Limits.reason_bytes)) };
+        return .{ .block = try hook.keep(text_utils.utf8PrefixByBytes(reason.string, hooks.Limits.reason_bytes)) };
     }
     if (object.get("arguments")) |rewritten| {
         if (rewritten != .object) {
@@ -362,7 +355,7 @@ fn runStop(ctx: *anyopaque, input: hooks.StopInput) hooks.HandlerError!hooks.Sto
     if (value == .object and value.object.count() == 1) {
         if (value.object.get("continue")) |context| {
             if (context == .string and context.string.len > 0) {
-                return .{ .continue_once = try hook.keep(truncateUtf8(context.string, hooks.Limits.context_bytes)) };
+                return .{ .continue_once = try hook.keep(text_utils.utf8PrefixByBytes(context.string, hooks.Limits.context_bytes)) };
             }
         }
     }
@@ -397,4 +390,18 @@ fn runAttentionRequired(ctx: *anyopaque, input: hooks.AttentionRequiredInput) ho
         .kind = @tagName(input.kind),
     });
     if (outcome != .value) return error.Failed;
+}
+
+test "the engine and fx's settings accept the same extension names" {
+    const listing = @import("listing.zig");
+    const accepted = [_][]const u8{ "a", "7", "policy", "my_ext-2", "0-_", text_utils.repeat("a", 64) };
+    const rejected = [_][]const u8{ "", "-x", "_x", "Policy", "a.b", "a/b", "..", "a b", "caf\xc3\xa9", text_utils.repeat("a", 65) };
+    for (accepted) |name| {
+        try std.testing.expect(engine.validExtensionName(name));
+        try std.testing.expect(listing.validName(name));
+    }
+    for (rejected) |name| {
+        try std.testing.expect(!engine.validExtensionName(name));
+        try std.testing.expect(!listing.validName(name));
+    }
 }

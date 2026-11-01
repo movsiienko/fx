@@ -25,6 +25,7 @@ const workspace_commands = @import("../workspace/workspace_commands.zig");
 const lua_host = @import("../lua_host/lua_host.zig");
 
 const Allocator = std.mem.Allocator;
+const writeTerminalSafe = text_utils.writeTerminalSafe;
 
 fn providerDisplayName(provider: *const model_provider.ProviderId) []const u8 {
     return if (provider.* == .configured) provider.label() else provider_catalog.label(provider.*);
@@ -845,12 +846,6 @@ pub const WorkspaceSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
-
-fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) !void {
-    var encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
-    defer encoded.deinit(alloc);
-    try writer.writeAll(encoded.bytes);
-}
 
 /// A terminal-safe copy of `raw`, allocated with `alloc`.
 fn safeText(alloc: Allocator, raw: []const u8) ![]const u8 {

@@ -109,6 +109,19 @@ fn isDigestPrefix(text: []const u8) bool {
     return true;
 }
 
+/// Whether `name` can name an extension: 1 to 64 lowercase letters,
+/// digits, `_` or `-`, starting with a letter or digit. The engine keeps
+/// its own copy for manifests, since it imports nothing from fx; a test in
+/// `adapter.zig` holds the two to the same names.
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (!std.ascii.isLower(name[0]) and !std.ascii.isDigit(name[0])) return false;
+    for (name) |byte| {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
 /// What `fx extensions` reports. `entries` and everything they point to
 /// live in `arena`, which the listing owns.
 pub const Listing = struct {

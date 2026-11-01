@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const extension_listing = @import("../lua_host/listing.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -924,7 +925,7 @@ fn validateMutation(mutation: SettingsMutation) !void {
             }
         },
         .extension => |extension| {
-            if (!validExtensionName(extension.name)) return error.InvalidDurableField;
+            if (!extension_listing.validName(extension.name)) return error.InvalidDurableField;
             switch (extension.action) {
                 .trust => |trust| {
                     if (!validSha256Hex(trust.sha256) or trust.files.len > max_extension_files) {
@@ -943,14 +944,6 @@ fn validateMutation(mutation: SettingsMutation) !void {
             }
         },
     }
-}
-
-fn validExtensionName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 64) return false;
-    for (name) |byte| {
-        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '_' and byte != '-') return false;
-    }
-    return true;
 }
 
 fn validSha256Hex(text: []const u8) bool {
@@ -1698,7 +1691,7 @@ fn validateExtensionsSetting(object: std.json.ObjectMap) !void {
     if (extensions != .object) return error.InvalidSettingsFormat;
     var it = extensions.object.iterator();
     while (it.next()) |entry| {
-        if (!validExtensionName(entry.key_ptr.*) or entry.value_ptr.* != .object) return error.InvalidSettingsFormat;
+        if (!extension_listing.validName(entry.key_ptr.*) or entry.value_ptr.* != .object) return error.InvalidSettingsFormat;
         const record = entry.value_ptr.object;
         if (record.get("sha256")) |digest| {
             if (digest != .string or !validSha256Hex(digest.string)) return error.InvalidSettingsFormat;
@@ -4312,4 +4305,25 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "extension mutation rejects stored records whose names extensions cannot have" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "Policy", "-x", "_x" }) |stored_name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        const fixture = try alloc.print("{{\"extensions\":{{\"{s}\":{{\"disabled\":true}}}}}}\n", .{stored_name});
+        defer alloc.free(fixture);
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        var store = try Store.initFromHome(alloc, home, .writable);
+        defer store.deinit(alloc);
+
+        try std.testing.expectError(
+            error.InvalidSettingsFormat,
+            store.applyExtensionMutation(alloc, .{ .name = "policy", .action = .{ .set_disabled = true } }),
+        );
+    }
 }

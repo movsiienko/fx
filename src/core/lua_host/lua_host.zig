@@ -12,6 +12,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const text_utils = @import("../shared/text_utils.zig");
 const listing = @import("listing.zig");
+const writeTerminalSafe = text_utils.writeTerminalSafe;
 
 const enabled = build_options.lua_hooks;
 const impl = if (enabled) @import("runtime.zig") else @import("disabled.zig");
@@ -86,12 +87,6 @@ pub fn noticeText(alloc: std.mem.Allocator, summary: Summary, review_command: []
         try writeTerminalSafe(w, alloc, failure.message);
     }
     return try out.toOwnedSlice();
-}
-
-fn writeTerminalSafe(w: *std.Io.Writer, alloc: std.mem.Allocator, raw: []const u8) !void {
-    const encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
-    defer alloc.free(encoded.bytes);
-    try w.writeAll(encoded.bytes);
 }
 
 test "the session-start notice names extensions waiting for review" {
